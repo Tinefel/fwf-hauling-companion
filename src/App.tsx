@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowsUpDownIcon,
   BuildingOffice2Icon,
@@ -77,6 +77,7 @@ declare global {
     webkitSpeechRecognition?: new () => any
     SpeechRecognition?: new () => any
     google?: any
+    __fwfSessionToken?: any
   }
 }
 
@@ -116,13 +117,111 @@ const DEFAULT_ROUTE_SUMMARY: RouteSummary = {
   total: 0,
 }
 
+const GOOGLE_MAPS_API_KEY = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY ?? '').trim()
+let googleMapsLoadPromise: Promise<void> | null = null
+
+const ensureGoogleMapsReady = async () => {
+  if (window.google?.maps?.places?.AutocompleteService) {
+    return
+  }
+
+  if (!GOOGLE_MAPS_API_KEY) {
+    throw new Error('Missing VITE_GOOGLE_MAPS_API_KEY')
+  }
+
+  if (googleMapsLoadPromise) {
+    await googleMapsLoadPromise
+    return
+  }
+
+  googleMapsLoadPromise = (async () => {
+    setOptions({
+      key: GOOGLE_MAPS_API_KEY,
+      libraries: ['places'],
+      language: 'en',
+      region: 'CA',
+    })
+
+    await importLibrary('maps')
+    await importLibrary('places')
+
+    if (!window.google?.maps?.places?.AutocompleteService) {
+      throw new Error('Google Places failed to initialize')
+    }
+  })()
+
+  try {
+    await googleMapsLoadPromise
+  } catch (error) {
+    googleMapsLoadPromise = null
+    throw error
+  }
+}
+
+
+const getSessionToken = () => {
+  if (!window.google?.maps?.places?.AutocompleteSessionToken) {
+    return null
+  }
+
+  if (!window.__fwfSessionToken) {
+    window.__fwfSessionToken = new window.google.maps.places.AutocompleteSessionToken()
+  }
+
+  return window.__fwfSessionToken
+}
+
 const fetchAddressSuggestions = async (query: string) => {
-  if (query.trim().length < 3) {
+  const trimmed = query.trim()
+  const hasGoogleService = !!window.google?.maps?.places?.AutocompleteService
+
+  console.log('[places] fetchAddressSuggestions', {
+    trimmed,
+    hasGoogleService,
+    hasGoogle: !!window.google,
+    hasMaps: !!window.google?.maps,
+    hasPlaces: !!window.google?.maps?.places,
+  })
+
+  if (!trimmed || trimmed.length < 2) {
     return []
   }
 
+  if (hasGoogleService) {
+    const service = new window.google.maps.places.AutocompleteService()
+    const sessionToken = getSessionToken()
+
+    return await new Promise<string[]>((resolve) => {
+      service.getPlacePredictions(
+        {
+          input: trimmed,
+          componentRestrictions: { country: 'CA' },
+          sessionToken,
+        },
+        (
+          predictions: Array<{ description: string; types?: string[] }> | null,
+          status: string,
+        ) => {
+          console.log('[places] raw Google response', {
+            query: trimmed,
+            status,
+            count: predictions?.length ?? 0,
+            first: predictions?.[0]?.description ?? null,
+          })
+
+          if (status === window.google.maps.places.PlacesServiceStatus.OK && predictions) {
+            resolve(predictions.map((prediction) => prediction.description))
+            return
+          }
+
+          resolve([])
+        },
+      )
+    })
+  }
+
   const response = await fetch(
-    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=${encodeURIComponent(query)}`,
+    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=${encodeURIComponent(trimmed)}`,
   )
 
   if (!response.ok) {
@@ -131,6 +230,56 @@ const fetchAddressSuggestions = async (query: string) => {
 
   const results = (await response.json()) as Array<{ display_name: string }>
   return results.map((result) => result.display_name)
+}
+
+const resolvePlaceAddress = async (query: string) => {
+  const trimmed = query.trim()
+  if (!trimmed) {
+    return ''
+  }
+
+  if (window.google?.maps?.places?.AutocompleteService) {
+    const service = new window.google.maps.places.AutocompleteService()
+    const sessionToken = getSessionToken()
+
+    return await new Promise<string>((resolve) => {
+      service.getPlacePredictions(
+        {
+          input: trimmed,
+          componentRestrictions: { country: 'CA' },
+          sessionToken,
+        },
+        (
+          predictions: Array<{ description: string; types?: string[] }> | null,
+          status: string,
+        ) => {
+          if (status === window.google.maps.places.PlacesServiceStatus.OK && predictions?.length) {
+            const winner = predictions[0].description
+            console.log('[places] resolvePlaceAddress callback', {
+              status,
+              query: trimmed,
+              first: winner,
+            })
+            resolve(winner)
+            return
+          }
+
+          resolve(trimmed)
+        },
+      )
+    })
+  }
+
+  const response = await fetch(
+    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(trimmed)}`,
+  )
+
+  if (!response.ok) {
+    return trimmed
+  }
+
+  const results = (await response.json()) as Array<{ display_name: string }>
+  return results[0]?.display_name ?? trimmed
 }
 
 const formatCurrency = (amount: number) =>
@@ -174,11 +323,9 @@ const readJson = <T,>(key: string, fallback: T): T => {
 }
 
 const geocodeAddress = async (address: string) => {
-  const googleKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined
-
-  if (googleKey) {
+  if (GOOGLE_MAPS_API_KEY) {
     const response = await fetch(
-      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${googleKey}`,
+      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${GOOGLE_MAPS_API_KEY}`,
     )
 
     if (!response.ok) {
@@ -220,9 +367,7 @@ const geocodeAddress = async (address: string) => {
 }
 
 const getGoogleRouteSummary = async (origin: string, destination: string) => {
-  const googleKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined
-
-  if (!googleKey) {
+  if (!GOOGLE_MAPS_API_KEY) {
     return null
   }
 
@@ -230,7 +375,7 @@ const getGoogleRouteSummary = async (origin: string, destination: string) => {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'X-Goog-Api-Key': googleKey,
+      'X-Goog-Api-Key': GOOGLE_MAPS_API_KEY,
       'X-Goog-FieldMask': 'routes.distanceMeters,routes.duration',
     },
     body: JSON.stringify({
@@ -349,6 +494,8 @@ const calculateSummary = async (
 function App() {
   const pickupRef = useRef<HTMLInputElement | null>(null)
   const dropoffRef = useRef<HTMLInputElement | null>(null)
+  const pickupSuggestionsRequestRef = useRef(0)
+  const dropoffSuggestionsRequestRef = useRef(0)
 
   const [settings, setSettings] = useState<Settings>(() => {
     const stored = readJson<Settings>(STORAGE_KEYS.settings, DEFAULT_SETTINGS)
@@ -373,6 +520,8 @@ function App() {
   const [dropoffAddress, setDropoffAddress] = useState('')
   const [pickupSuggestions, setPickupSuggestions] = useState<string[]>([])
   const [dropoffSuggestions, setDropoffSuggestions] = useState<string[]>([])
+  const [pickupSuggestionsVisible, setPickupSuggestionsVisible] = useState(false)
+  const [dropoffSuggestionsVisible, setDropoffSuggestionsVisible] = useState(false)
   const [customerName, setCustomerName] = useState('')
   const [customerPhone, setCustomerPhone] = useState('')
   const [customerEmail, setCustomerEmail] = useState('')
@@ -388,6 +537,85 @@ function App() {
   const [installPromptEvent, setInstallPromptEvent] = useState<any>(null)
   const [isAdditionalDetailsOpen, setIsAdditionalDetailsOpen] = useState(false)
   const [isMoreFuelDetailsOpen, setIsMoreFuelDetailsOpen] = useState(false)
+
+  const refreshSuggestions = useCallback(
+    async (field: 'pickup' | 'dropoff', value: string) => {
+      const trimmed = value.trim()
+      console.log('[suggestions] input update', {
+        field,
+        currentValue: trimmed,
+        length: trimmed.length,
+      })
+
+      const requestRef = field === 'pickup' ? pickupSuggestionsRequestRef : dropoffSuggestionsRequestRef
+      const requestId = ++requestRef.current
+
+      if (!trimmed) {
+        if (field === 'pickup') {
+          setPickupSuggestions([])
+          setPickupSuggestionsVisible(false)
+        } else {
+          setDropoffSuggestions([])
+          setDropoffSuggestionsVisible(false)
+        }
+
+        console.log('[suggestions] cleared due to empty query', {
+          field,
+          currentValue: trimmed,
+          dropdownVisible: false,
+        })
+        return
+      }
+
+      const predictions = await fetchAddressSuggestions(trimmed)
+      console.log('[suggestions] prediction callback', {
+        field,
+        currentValue: trimmed,
+        count: predictions.length,
+        predictions,
+      })
+
+      if (requestId !== requestRef.current) {
+        console.log('[suggestions] stale response ignored', {
+          field,
+          currentValue: trimmed,
+          requestId,
+          latestRequestId: requestRef.current,
+        })
+        return
+      }
+
+      if (field === 'pickup') {
+        setPickupSuggestions(predictions)
+        setPickupSuggestionsVisible(predictions.length > 0)
+      } else {
+        setDropoffSuggestions(predictions)
+        setDropoffSuggestionsVisible(predictions.length > 0)
+      }
+
+      console.log('[suggestions] dropdown visible state', {
+        field,
+        currentValue: trimmed,
+        dropdownVisible: field === 'pickup' ? pickupSuggestionsVisible : dropoffSuggestionsVisible,
+        count: predictions.length,
+      })
+    },
+    [pickupSuggestionsVisible, dropoffSuggestionsVisible],
+  )
+
+  const applyAddressValue = useCallback(
+    (field: 'pickup' | 'dropoff', nextValue: string) => {
+      if (field === 'pickup') {
+        setPickupAddress(nextValue)
+        void refreshSuggestions('pickup', nextValue)
+        return
+      }
+
+      setDropoffAddress(nextValue)
+      void refreshSuggestions('dropoff', nextValue)
+    },
+    [refreshSuggestions],
+  )
 
   const internalBusinessSummary = useMemo(() => {
     const deadheadFuelUsed = (routeSummary.deadheadDistanceKm / 100) * settings.deadheadFuelEconomy
@@ -442,98 +670,89 @@ function App() {
 
   useEffect(() => {
     const loadGoogle = async () => {
-      const googleKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined
-      if (!googleKey) {
+      console.log('[google] loadGoogle start', {
+        hasKey: !!GOOGLE_MAPS_API_KEY,
+        hasGoogle: !!window.google,
+        hasMaps: !!window.google?.maps,
+      })
+
+      if (!GOOGLE_MAPS_API_KEY) {
+        console.log('[google] missing API key')
         setGoogleReady(false)
         return
       }
 
-      setOptions({
-        key: googleKey,
-        libraries: ['places'],
-      })
+      try {
+        await ensureGoogleMapsReady()
 
-      await importLibrary('maps')
-      await importLibrary('places')
-      setGoogleReady(true)
+        console.log('[google] script ready', {
+          hasGoogle: !!window.google,
+          hasMaps: !!window.google?.maps,
+          hasPlaces: !!window.google?.maps?.places,
+          hasAutocomplete: !!window.google?.maps?.places?.Autocomplete,
+          hasAutocompleteService: !!window.google?.maps?.places?.AutocompleteService,
+        })
+
+        const validationResponse = await fetch(
+          `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(settings.yardAddress)}&key=${GOOGLE_MAPS_API_KEY}`,
+        )
+        const validationPayload = await validationResponse.json()
+        const validationStatus = validationPayload?.status
+        console.log('[google] validation check', { validationStatus, ok: validationResponse.ok })
+
+        if (!validationResponse.ok || validationStatus !== 'OK') {
+          console.error('[google] Google Places validation failed', validationPayload)
+          setGoogleReady(false)
+          return
+        }
+
+        setGoogleReady(true)
+      } catch (error) {
+        console.error('[google] loadGoogle failed', error)
+        setGoogleReady(false)
+      }
     }
 
-    loadGoogle().catch(() => setGoogleReady(false))
-  }, [])
+    void loadGoogle()
+  }, [settings.yardAddress])
 
   useEffect(() => {
-    const attachAutocomplete = (
-      ref: HTMLInputElement | null,
-      setter: (value: string) => void,
-      suggestionsSetter: (values: string[]) => void,
-      suggestionListId: string,
-    ) => {
-      if (!ref) {
+    console.log('[input] stable input refs mounted', {
+      pickupSame: pickupRef.current === document.getElementById('pickup-address-input'),
+      dropoffSame: dropoffRef.current === document.getElementById('dropoff-address-input'),
+      googleReady,
+    })
+  }, [googleReady])
+
+  useEffect(() => {
+    if (activePage !== 'home') {
+      return undefined
+    }
+
+    let active = true
+
+    const initialize = async () => {
+      try {
+        await ensureGoogleMapsReady()
+      } catch (error) {
+        console.error('[google] Home initialization failed', error)
+        if (active) {
+          setGoogleReady(false)
+        }
         return
       }
 
-      ref.setAttribute('autocomplete', 'off')
-      ref.setAttribute('list', suggestionListId)
-
-      let autocomplete: any = null
-
-      const onInput = async () => {
-        const query = ref.value.trim()
-        const results = await fetchAddressSuggestions(query)
-        suggestionsSetter(results)
-
-        if (!window.google?.maps?.places?.Autocomplete || ref.dataset.autocompleteBound === 'true') {
-          return
-        }
-
-        if (query.length < 2) {
-          return
-        }
-
-        autocomplete = new window.google.maps.places.Autocomplete(ref, {
-          fields: ['formatted_address'],
-          types: ['address'],
-          componentRestrictions: { country: 'CA' },
-        })
-
-        autocomplete.addListener('place_changed', () => {
-          const place = autocomplete.getPlace()
-          const value = place?.formatted_address ?? ref.value
-          setter(value)
-          addRecentAddress(value)
-        })
-
-        ref.dataset.autocompleteBound = 'true'
-      }
-
-      ref.addEventListener('input', onInput)
-
-      return () => {
-        ref.removeEventListener('input', onInput)
-        if (autocomplete) {
-          google.maps.event.clearInstanceListeners(autocomplete)
-        }
+      if (active) {
+        setGoogleReady(true)
       }
     }
 
-    const cleanupPickup = attachAutocomplete(
-      pickupRef.current,
-      setPickupAddress,
-      setPickupSuggestions,
-      'pickup-suggestions',
-    )
-    const cleanupDropoff = attachAutocomplete(
-      dropoffRef.current,
-      setDropoffAddress,
-      setDropoffSuggestions,
-      'dropoff-suggestions',
-    )
+    void initialize()
 
     return () => {
-      cleanupPickup?.()
-      cleanupDropoff?.()
+      active = false
     }
-  }, [googleReady])
+  }, [activePage])
 
   useEffect(() => {
     const updateSummary = async () => {
@@ -578,34 +797,83 @@ function App() {
     )
   }, [quotes, searchTerm])
 
-  const voiceCapture = (setter: (value: string) => void) => {
+  const voiceCapture = async (setter: (value: string) => void) => {
     const recognitionCtor = window.SpeechRecognition ?? window.webkitSpeechRecognition
+    console.log('[voice] capture start', {
+      hasRecognition: !!recognitionCtor,
+      hasMediaDevices: !!navigator.mediaDevices?.getUserMedia,
+      microphonePermission: navigator.permissions ? 'available' : 'unavailable',
+    })
+
     if (!recognitionCtor) {
+      console.log('[voice] speech recognition API missing')
       window.alert('Voice input is not available in this browser.')
       return
+    }
+
+    if (navigator.mediaDevices?.getUserMedia) {
+      try {
+        const permission = navigator.permissions?.query
+          ? await navigator.permissions.query({ name: 'microphone' as PermissionName }).catch(() => null)
+          : null
+        console.log('[voice] microphone permission', permission?.state ?? 'not-queryable')
+
+        if (permission?.state === 'denied') {
+          window.alert('Microphone access is required for voice input.')
+          return
+        }
+
+        await navigator.mediaDevices.getUserMedia({ audio: true })
+      } catch (error) {
+        console.error('[voice] microphone permission denied', error)
+        window.alert('Microphone access is required for voice input.')
+        return
+      }
     }
 
     const recognition = new recognitionCtor()
     recognition.lang = 'en-US'
     recognition.interimResults = false
     recognition.maxAlternatives = 1
-    recognition.onresult = (event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => {
-      const transcript = event.results[0][0].transcript
-      setter(transcript)
+    recognition.onresult = async (event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => {
+      const transcript = event.results[0][0].transcript.trim()
+      console.log('[voice] transcript received', { transcript })
+      if (!transcript) {
+        return
+      }
+
+      const resolvedAddress = await resolvePlaceAddress(transcript)
+      setter(resolvedAddress)
+      addRecentAddress(resolvedAddress)
     }
-    recognition.onerror = () => {
+    recognition.onerror = (event: { error?: string }) => {
+      const error = event?.error ?? 'unknown'
+      console.error('[voice] recognition error', error)
+      if (error === 'not-allowed' || error === 'service-not-allowed' || error === 'audio-capture') {
+        window.alert('Microphone access is required for voice input.')
+        return
+      }
+
       window.alert('Unable to capture speech right now. Please try again.')
     }
-    recognition.start()
+    recognition.onstart = () => {
+      console.log('[voice] recognition started')
+    }
+    try {
+      recognition.start()
+    } catch (error) {
+      console.error('[voice] recognition.start failed', error)
+      window.alert('Unable to capture speech right now. Please try again.')
+    }
   }
 
-  const addRecentAddress = (address: string) => {
+  const addRecentAddress = useCallback((address: string) => {
     if (!address) {
       return
     }
 
     setRecentAddresses((current) => [address, ...current.filter((entry) => entry !== address)].slice(0, 8))
-  }
+  }, [])
 
   const toggleFavoriteAddress = (
     address: string,
@@ -862,19 +1130,48 @@ function App() {
                     <label className="mb-2 block text-sm font-semibold">Pickup Address</label>
                     <div className="relative">
                       <input
+                        key="pickup-address-input"
+                        id="pickup-address-input"
                         ref={pickupRef}
+                        autoComplete="off"
                         list="pickup-suggestions"
                         value={pickupAddress}
-                        onChange={(event) => setPickupAddress(event.target.value)}
-                        onBlur={() => addRecentAddress(pickupAddress)}
+                        onInput={(event) => {
+                          const nextValue = event.currentTarget.value
+                          applyAddressValue('pickup', nextValue)
+                        }}
+                        onFocus={() => {
+                          void refreshSuggestions('pickup', pickupAddress)
+                        }}
+                        onBlur={() => {
+                          window.setTimeout(() => {
+                            setPickupSuggestionsVisible(false)
+                          }, 120)
+                          addRecentAddress(pickupAddress)
+                        }}
                         placeholder="Enter pickup address"
                         className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 pr-12 outline-none transition focus:border-amber-700"
                       />
-                      <datalist id="pickup-suggestions">
-                        {pickupSuggestions.map((suggestion) => (
-                          <option key={suggestion} value={suggestion} />
-                        ))}
-                      </datalist>
+                      {pickupSuggestionsVisible && pickupSuggestions.length > 0 && (
+                        <div className="absolute left-0 right-0 top-full z-50 mt-2 overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-xl ring-1 ring-stone-100">
+                          {pickupSuggestions.map((suggestion) => (
+                            <button
+                              key={suggestion}
+                              type="button"
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={() => {
+                                setPickupAddress(suggestion)
+                                setPickupSuggestions([])
+                                setPickupSuggestionsVisible(false)
+                                addRecentAddress(suggestion)
+                              }}
+                              className="block w-full border-b border-stone-100 px-4 py-3 text-left text-sm text-stone-700 last:border-b-0 hover:bg-stone-50"
+                            >
+                              {suggestion}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                       <button
                         type="button"
                         onClick={() => voiceCapture(setPickupAddress)}
@@ -904,19 +1201,48 @@ function App() {
                     <label className="mb-2 block text-sm font-semibold">Drop-off Address</label>
                     <div className="relative">
                       <input
+                        key="dropoff-address-input"
+                        id="dropoff-address-input"
                         ref={dropoffRef}
+                        autoComplete="off"
                         list="dropoff-suggestions"
                         value={dropoffAddress}
-                        onChange={(event) => setDropoffAddress(event.target.value)}
-                        onBlur={() => addRecentAddress(dropoffAddress)}
+                        onInput={(event) => {
+                          const nextValue = event.currentTarget.value
+                          applyAddressValue('dropoff', nextValue)
+                        }}
+                        onFocus={() => {
+                          void refreshSuggestions('dropoff', dropoffAddress)
+                        }}
+                        onBlur={() => {
+                          window.setTimeout(() => {
+                            setDropoffSuggestionsVisible(false)
+                          }, 120)
+                          addRecentAddress(dropoffAddress)
+                        }}
                         placeholder="Enter drop-off address"
                         className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 pr-12 outline-none transition focus:border-amber-700"
                       />
-                      <datalist id="dropoff-suggestions">
-                        {dropoffSuggestions.map((suggestion) => (
-                          <option key={suggestion} value={suggestion} />
-                        ))}
-                      </datalist>
+                      {dropoffSuggestionsVisible && dropoffSuggestions.length > 0 && (
+                        <div className="absolute left-0 right-0 top-full z-50 mt-2 overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-xl ring-1 ring-stone-100">
+                          {dropoffSuggestions.map((suggestion) => (
+                            <button
+                              key={suggestion}
+                              type="button"
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={() => {
+                                setDropoffAddress(suggestion)
+                                setDropoffSuggestions([])
+                                setDropoffSuggestionsVisible(false)
+                                addRecentAddress(suggestion)
+                              }}
+                              className="block w-full border-b border-stone-100 px-4 py-3 text-left text-sm text-stone-700 last:border-b-0 hover:bg-stone-50"
+                            >
+                              {suggestion}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                       <button
                         type="button"
                         onClick={() => voiceCapture(setDropoffAddress)}
@@ -1477,7 +1803,7 @@ function App() {
               <PencilSquareIcon className="h-5 w-5 text-amber-900" />
             </div>
 
-            {!import.meta.env.VITE_GOOGLE_MAPS_API_KEY && (
+            {!GOOGLE_MAPS_API_KEY && (
               <div className="mb-4 rounded-2xl bg-amber-50 p-3 text-sm text-amber-900 ring-1 ring-amber-200">
                 Google Places autocomplete is not configured yet. Add <span className="font-semibold">VITE_GOOGLE_MAPS_API_KEY</span> to your environment to enable address suggestions and route lookups. Manual typing, quote history, and local settings still work normally.
               </div>
