@@ -6,14 +6,12 @@ import {
   ChevronUpIcon,
   ClockIcon,
   Cog6ToothIcon,
-  HeartIcon,
   HomeIcon,
   MicrophoneIcon,
   PencilSquareIcon,
   TruckIcon,
 } from '@heroicons/react/24/outline'
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader'
-import { jsPDF } from 'jspdf'
 
 type RouteSummary = {
   loadedDistanceKm: number
@@ -84,9 +82,8 @@ declare global {
 const STORAGE_KEYS = {
   settings: 'fwf-hauling-settings',
   quotes: 'fwf-hauling-quotes',
-  favoritePickup: 'fwf-hauling-favorite-pickup',
-  favoriteDropoff: 'fwf-hauling-favorite-dropoff',
-  recent: 'fwf-hauling-recent',
+  recentPickup: 'fwf-hauling-recent-pickup',
+  recentDropoff: 'fwf-hauling-recent-dropoff',
   customers: 'fwf-hauling-customers',
 }
 
@@ -290,6 +287,17 @@ const formatCurrency = (amount: number) =>
   }).format(amount)
 
 const formatKm = (value: number) => `${value.toFixed(1)} km`
+
+const formatDriveTime = (minutes: number) => {
+  const hours = Math.floor(minutes / 60)
+  const remainingMinutes = minutes % 60
+
+  if (hours > 0) {
+    return `${hours} hr ${remainingMinutes} min`
+  }
+
+  return `${remainingMinutes} min`
+}
 
 const haversineKm = (
   lat1: number,
@@ -504,16 +512,13 @@ function App() {
   const [quotes, setQuotes] = useState<QuoteRecord[]>(() =>
     readJson<QuoteRecord[]>(STORAGE_KEYS.quotes, []),
   )
-  const [favoritePickupAddresses, setFavoritePickupAddresses] = useState<string[]>(() =>
-    readJson<string[]>(STORAGE_KEYS.favoritePickup, []),
+  const [recentPickupAddresses, setRecentPickupAddresses] = useState<string[]>(() =>
+    readJson<string[]>(STORAGE_KEYS.recentPickup, []),
   )
-  const [favoriteDropoffAddresses, setFavoriteDropoffAddresses] = useState<string[]>(() =>
-    readJson<string[]>(STORAGE_KEYS.favoriteDropoff, []),
+  const [recentDropoffAddresses, setRecentDropoffAddresses] = useState<string[]>(() =>
+    readJson<string[]>(STORAGE_KEYS.recentDropoff, []),
   )
-  const [recentAddresses, setRecentAddresses] = useState<string[]>(() =>
-    readJson<string[]>(STORAGE_KEYS.recent, []),
-  )
-  const [customers, setCustomers] = useState<CustomerRecord[]>(() =>
+  const [customers] = useState<CustomerRecord[]>(() =>
     readJson<CustomerRecord[]>(STORAGE_KEYS.customers, []),
   )
   const [pickupAddress, setPickupAddress] = useState('')
@@ -537,6 +542,8 @@ function App() {
   const [installPromptEvent, setInstallPromptEvent] = useState<any>(null)
   const [isAdditionalDetailsOpen, setIsAdditionalDetailsOpen] = useState(false)
   const [isMoreFuelDetailsOpen, setIsMoreFuelDetailsOpen] = useState(false)
+  const [isRecentPickupOpen, setIsRecentPickupOpen] = useState(false)
+  const [isRecentDropoffOpen, setIsRecentDropoffOpen] = useState(false)
 
   const refreshSuggestions = useCallback(
     async (field: 'pickup' | 'dropoff', value: string) => {
@@ -653,16 +660,12 @@ function App() {
   }, [quotes])
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.favoritePickup, JSON.stringify(favoritePickupAddresses))
-  }, [favoritePickupAddresses])
+    localStorage.setItem(STORAGE_KEYS.recentPickup, JSON.stringify(recentPickupAddresses))
+  }, [recentPickupAddresses])
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.favoriteDropoff, JSON.stringify(favoriteDropoffAddresses))
-  }, [favoriteDropoffAddresses])
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.recent, JSON.stringify(recentAddresses))
-  }, [recentAddresses])
+    localStorage.setItem(STORAGE_KEYS.recentDropoff, JSON.stringify(recentDropoffAddresses))
+  }, [recentDropoffAddresses])
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.customers, JSON.stringify(customers))
@@ -797,7 +800,7 @@ function App() {
     )
   }, [quotes, searchTerm])
 
-  const voiceCapture = async (setter: (value: string) => void) => {
+  const voiceCapture = async (setter: (value: string) => void, type: 'pickup' | 'dropoff') => {
     const recognitionCtor = window.SpeechRecognition ?? window.webkitSpeechRecognition
     console.log('[voice] capture start', {
       hasRecognition: !!recognitionCtor,
@@ -844,7 +847,7 @@ function App() {
 
       const resolvedAddress = await resolvePlaceAddress(transcript)
       setter(resolvedAddress)
-      addRecentAddress(resolvedAddress)
+      addRecentAddress(resolvedAddress, type)
     }
     recognition.onerror = (event: { error?: string }) => {
       const error = event?.error ?? 'unknown'
@@ -867,37 +870,23 @@ function App() {
     }
   }
 
-  const addRecentAddress = useCallback((address: string) => {
-    if (!address) {
-      return
-    }
-
-    setRecentAddresses((current) => [address, ...current.filter((entry) => entry !== address)].slice(0, 8))
-  }, [])
-
-  const toggleFavoriteAddress = (
-    address: string,
-    type: 'pickup' | 'dropoff',
-  ) => {
-    if (!address.trim()) {
+  const addRecentAddress = useCallback((address: string, type: 'pickup' | 'dropoff') => {
+    const trimmedAddress = address.trim()
+    if (!trimmedAddress) {
       return
     }
 
     if (type === 'pickup') {
-      setFavoritePickupAddresses((current) =>
-        current.includes(address)
-          ? current.filter((entry) => entry !== address)
-          : [address, ...current].slice(0, 8),
+      setRecentPickupAddresses((current) =>
+        [trimmedAddress, ...current.filter((entry) => entry !== trimmedAddress)].slice(0, 20),
       )
       return
     }
 
-    setFavoriteDropoffAddresses((current) =>
-      current.includes(address)
-        ? current.filter((entry) => entry !== address)
-        : [address, ...current].slice(0, 8),
+    setRecentDropoffAddresses((current) =>
+      [trimmedAddress, ...current.filter((entry) => entry !== trimmedAddress)].slice(0, 20),
     )
-  }
+  }, [])
 
   const swapAddresses = () => {
     const previousPickup = pickupAddress
@@ -910,49 +899,6 @@ function App() {
     setCustomerPhone(customer.phone)
     setCustomerEmail(customer.email)
     setNotes(customer.notes)
-  }
-
-  const saveQuote = () => {
-    if (!pickupAddress || !dropoffAddress) {
-      return
-    }
-
-    const quoteNumber = buildQuoteNumber(quotes)
-    const quoteRecord: QuoteRecord = {
-      quoteNumber,
-      customer: customerName || 'Walk-in',
-      customerPhone,
-      customerEmail,
-      pickup: pickupAddress,
-      dropoff: dropoffAddress,
-      loadDescription,
-      trailerType,
-      loadWeightLbs,
-      loadedKm: Number(routeSummary.loadedDistanceKm.toFixed(1)),
-      deadheadKm: Number(routeSummary.deadheadDistanceKm.toFixed(1)),
-      driveTime: `${routeSummary.driveTimeMinutes} min`,
-      loadedCost: Number(routeSummary.loadedCost.toFixed(2)),
-      deadheadCost: Number(routeSummary.deadheadCost.toFixed(2)),
-      minimumChargeAdjustment: Number(routeSummary.minimumChargeAdjustment.toFixed(2)),
-      subtotal: Number(routeSummary.subtotal.toFixed(2)),
-      gst: Number(routeSummary.gst.toFixed(2)),
-      total: Number(routeSummary.total.toFixed(2)),
-      notes,
-      createdAt: new Date().toISOString(),
-    }
-
-    setQuotes((current) => [quoteRecord, ...current])
-    addRecentAddress(pickupAddress)
-    addRecentAddress(dropoffAddress)
-
-    if (customerName.trim()) {
-      setCustomers((current) => {
-        const next = current.filter((entry) => entry.name.toLowerCase() !== customerName.trim().toLowerCase())
-        return [{ name: customerName.trim(), phone: customerPhone, email: customerEmail, notes: notes.trim() }, ...next]
-      })
-    }
-
-    setActivePage('history')
   }
 
   const quoteText = (quote: QuoteRecord) =>
@@ -1036,52 +982,6 @@ function App() {
     })
   }
 
-  const generatePdf = (quote?: QuoteRecord) => {
-    const selected = quote ?? {
-      quoteNumber: buildQuoteNumber(quotes),
-      customer: customerName || 'Walk-in',
-      customerPhone,
-      customerEmail,
-      pickup: pickupAddress,
-      dropoff: dropoffAddress,
-      loadDescription,
-      trailerType,
-      loadWeightLbs,
-      loadedKm: Number(routeSummary.loadedDistanceKm.toFixed(1)),
-      deadheadKm: Number(routeSummary.deadheadDistanceKm.toFixed(1)),
-      driveTime: `${routeSummary.driveTimeMinutes} min`,
-      loadedCost: Number(routeSummary.loadedCost.toFixed(2)),
-      deadheadCost: Number(routeSummary.deadheadCost.toFixed(2)),
-      minimumChargeAdjustment: Number(routeSummary.minimumChargeAdjustment.toFixed(2)),
-      subtotal: Number(routeSummary.subtotal.toFixed(2)),
-      gst: Number(routeSummary.gst.toFixed(2)),
-      total: Number(routeSummary.total.toFixed(2)),
-      notes,
-      createdAt: new Date().toISOString(),
-    }
-
-    const doc = new jsPDF()
-    doc.setFont('helvetica', 'bold')
-    doc.text(settings.companyName || 'FWF Hauling Companion', 14, 14)
-    doc.setFont('helvetica', 'normal')
-    doc.text(`Quote: ${selected.quoteNumber}`, 14, 22)
-    doc.text(`Customer: ${selected.customer}`, 14, 30)
-    doc.text(`Phone: ${selected.customerPhone || '—'}`, 14, 38)
-    doc.text(`Email: ${selected.customerEmail || '—'}`, 14, 46)
-    doc.text(`Pickup: ${selected.pickup}`, 14, 54)
-    doc.text(`Drop-off: ${selected.dropoff}`, 14, 62)
-    doc.text(`Loaded Distance: ${formatKm(selected.loadedKm)}`, 14, 70)
-    doc.text(`Deadhead Distance: ${formatKm(selected.deadheadKm)}`, 14, 78)
-    doc.text(`Drive Time: ${selected.driveTime}`, 14, 86)
-    doc.text(`Loaded Cost: ${formatCurrency(selected.loadedCost)}`, 14, 94)
-    doc.text(`Deadhead Cost: ${formatCurrency(selected.deadheadCost)}`, 14, 102)
-    doc.text(`Minimum Charge Adjustment: ${formatCurrency(selected.minimumChargeAdjustment)}`, 14, 110)
-    doc.text(`Subtotal: ${formatCurrency(selected.subtotal)}`, 14, 118)
-    doc.text(`GST: ${formatCurrency(selected.gst)}`, 14, 126)
-    doc.text(`Grand Total: ${formatCurrency(selected.total)}`, 14, 134)
-    doc.save(`${selected.quoteNumber}.pdf`)
-  }
-
   const duplicateQuote = (quote: QuoteRecord) => {
     const duplicatedQuote: QuoteRecord = {
       ...quote,
@@ -1095,8 +995,6 @@ function App() {
   const deleteQuote = (quoteNumber: string) => {
     setQuotes((current) => current.filter((quote) => quote.quoteNumber !== quoteNumber))
   }
-
-  const canSaveQuote = pickupAddress.trim() && dropoffAddress.trim() && routeSummary.total > 0
 
   return (
     <div className="min-h-screen bg-stone-50 text-stone-900">
@@ -1122,8 +1020,9 @@ function App() {
         </header>
 
         {activePage === 'home' && (
-          <div className="grid gap-4 lg:grid-cols-[1.1fr,0.9fr]">
-            <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
+          <>
+            <div className="grid gap-4 lg:grid-cols-[1.1fr,0.9fr]">
+              <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
               <div className="grid gap-3">
                 <div className="relative grid gap-2">
                   <div className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
@@ -1147,7 +1046,7 @@ function App() {
                           window.setTimeout(() => {
                             setPickupSuggestionsVisible(false)
                           }, 120)
-                          addRecentAddress(pickupAddress)
+                          addRecentAddress(pickupAddress, 'pickup')
                         }}
                         placeholder="Enter pickup address"
                         className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 pr-12 outline-none transition focus:border-amber-700"
@@ -1163,7 +1062,7 @@ function App() {
                                 setPickupAddress(suggestion)
                                 setPickupSuggestions([])
                                 setPickupSuggestionsVisible(false)
-                                addRecentAddress(suggestion)
+                                addRecentAddress(suggestion, 'pickup')
                               }}
                               className="block w-full border-b border-stone-100 px-4 py-3 text-left text-sm text-stone-700 last:border-b-0 hover:bg-stone-50"
                             >
@@ -1174,26 +1073,11 @@ function App() {
                       )}
                       <button
                         type="button"
-                        onClick={() => voiceCapture(setPickupAddress)}
+                        onClick={() => voiceCapture(setPickupAddress, 'pickup')}
                         className="absolute right-2 top-1/2 -translate-y-1/2 rounded-full bg-amber-900 p-2 text-white"
                       >
                         <MicrophoneIcon className="h-4 w-4" />
                       </button>
-                    </div>
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      {favoritePickupAddresses.slice(0, 4).map((address) => (
-                        <button
-                          key={address}
-                          type="button"
-                          onClick={() => {
-                            setPickupAddress(address)
-                            addRecentAddress(address)
-                          }}
-                          className="rounded-full bg-stone-200 px-3 py-1 text-xs font-medium"
-                        >
-                          {address}
-                        </button>
-                      ))}
                     </div>
                   </div>
 
@@ -1218,7 +1102,7 @@ function App() {
                           window.setTimeout(() => {
                             setDropoffSuggestionsVisible(false)
                           }, 120)
-                          addRecentAddress(dropoffAddress)
+                          addRecentAddress(dropoffAddress, 'dropoff')
                         }}
                         placeholder="Enter drop-off address"
                         className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 pr-12 outline-none transition focus:border-amber-700"
@@ -1234,7 +1118,7 @@ function App() {
                                 setDropoffAddress(suggestion)
                                 setDropoffSuggestions([])
                                 setDropoffSuggestionsVisible(false)
-                                addRecentAddress(suggestion)
+                                addRecentAddress(suggestion, 'dropoff')
                               }}
                               className="block w-full border-b border-stone-100 px-4 py-3 text-left text-sm text-stone-700 last:border-b-0 hover:bg-stone-50"
                             >
@@ -1245,26 +1129,11 @@ function App() {
                       )}
                       <button
                         type="button"
-                        onClick={() => voiceCapture(setDropoffAddress)}
+                        onClick={() => voiceCapture(setDropoffAddress, 'dropoff')}
                         className="absolute right-2 top-1/2 -translate-y-1/2 rounded-full bg-amber-900 p-2 text-white"
                       >
                         <MicrophoneIcon className="h-4 w-4" />
                       </button>
-                    </div>
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      {favoriteDropoffAddresses.slice(0, 4).map((address) => (
-                        <button
-                          key={address}
-                          type="button"
-                          onClick={() => {
-                            setDropoffAddress(address)
-                            addRecentAddress(address)
-                          }}
-                          className="rounded-full bg-stone-200 px-3 py-1 text-xs font-medium"
-                        >
-                          {address}
-                        </button>
-                      ))}
                     </div>
                   </div>
 
@@ -1300,7 +1169,7 @@ function App() {
                     </div>
                     <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2">
                       <span className="text-sm text-stone-600">Estimated Drive Time</span>
-                      <span className="font-semibold">{routeSummary.driveTimeMinutes} min</span>
+                      <span className="font-semibold">{formatDriveTime(routeSummary.driveTimeMinutes)}</span>
                     </div>
                     <div className="rounded-xl bg-white px-3 py-2">
                       <div className="flex items-center justify-between">
@@ -1365,14 +1234,6 @@ function App() {
                   <div className="mt-4 grid gap-2 sm:grid-cols-2">
                     <button
                       type="button"
-                      onClick={saveQuote}
-                      disabled={!canSaveQuote}
-                      className="rounded-2xl bg-amber-900 px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
-                    >
-                      Save Quote
-                    </button>
-                    <button
-                      type="button"
                       onClick={() => copyQuote()}
                       className="rounded-2xl bg-stone-900 px-4 py-3 text-sm font-semibold text-white"
                     >
@@ -1384,13 +1245,6 @@ function App() {
                       className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800"
                     >
                       Share Quote
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => generatePdf()}
-                      className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800"
-                    >
-                      Export PDF
                     </button>
                   </div>
                 </section>
@@ -1502,169 +1356,75 @@ function App() {
                   )}
                 </section>
 
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => toggleFavoriteAddress(pickupAddress, 'pickup')}
-                    className="inline-flex items-center gap-2 rounded-full bg-stone-900 px-4 py-2 text-sm font-semibold text-white"
-                  >
-                    <HeartIcon className="h-4 w-4" />
-                    Favorite Pickup
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => toggleFavoriteAddress(dropoffAddress, 'dropoff')}
-                    className="inline-flex items-center gap-2 rounded-full bg-stone-900 px-4 py-2 text-sm font-semibold text-white"
-                  >
-                    <HeartIcon className="h-4 w-4" />
-                    Favorite Drop-off
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => (installPromptEvent ? installPromptEvent.prompt() : undefined)}
-                    className="rounded-full bg-amber-900 px-4 py-2 text-sm font-semibold text-white"
-                  >
-                    Install App
-                  </button>
-                  {googleReady && (
-                    <span className="rounded-full bg-emerald-100 px-3 py-2 text-xs font-semibold text-emerald-700">
-                      Google Places ready
-                    </span>
-                  )}
-                </div>
+                <div className="mt-3 grid gap-2">
+                  <div className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
+                    <button
+                      type="button"
+                      onClick={() => setIsRecentPickupOpen((current) => !current)}
+                      className="flex w-full items-center justify-between rounded-2xl bg-white px-3 py-2 text-left"
+                    >
+                      <span className="text-sm font-semibold text-stone-900">Recent Pickup Addresses</span>
+                      {isRecentPickupOpen ? (
+                        <ChevronUpIcon className="h-4 w-4 text-stone-700" />
+                      ) : (
+                        <ChevronDownIcon className="h-4 w-4 text-stone-700" />
+                      )}
+                    </button>
+                    {isRecentPickupOpen && (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {recentPickupAddresses.map((address) => (
+                          <button
+                            key={address}
+                            type="button"
+                            onClick={() => {
+                              setPickupAddress(address)
+                              addRecentAddress(address, 'pickup')
+                            }}
+                            className="rounded-full bg-stone-200 px-3 py-1 text-xs font-medium"
+                          >
+                            {address}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
 
-                <div className="mt-3 rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
-                  <p className="mb-2 text-sm font-semibold">Recent Addresses</p>
-                  <div className="flex flex-wrap gap-2">
-                    {recentAddresses.slice(0, 6).map((address) => (
-                      <button
-                        key={address}
-                        type="button"
-                        onClick={() => {
-                          setPickupAddress(address)
-                          addRecentAddress(address)
-                        }}
-                        className="rounded-full bg-stone-200 px-3 py-1 text-xs font-medium"
-                      >
-                        {address}
-                      </button>
-                    ))}
+                  <div className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
+                    <button
+                      type="button"
+                      onClick={() => setIsRecentDropoffOpen((current) => !current)}
+                      className="flex w-full items-center justify-between rounded-2xl bg-white px-3 py-2 text-left"
+                    >
+                      <span className="text-sm font-semibold text-stone-900">Recent Drop-off Addresses</span>
+                      {isRecentDropoffOpen ? (
+                        <ChevronUpIcon className="h-4 w-4 text-stone-700" />
+                      ) : (
+                        <ChevronDownIcon className="h-4 w-4 text-stone-700" />
+                      )}
+                    </button>
+                    {isRecentDropoffOpen && (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {recentDropoffAddresses.map((address) => (
+                          <button
+                            key={address}
+                            type="button"
+                            onClick={() => {
+                              setDropoffAddress(address)
+                              addRecentAddress(address, 'dropoff')
+                            }}
+                            className="rounded-full bg-stone-200 px-3 py-1 text-xs font-medium"
+                          >
+                            {address}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
             </section>
 
             <aside className="space-y-4">
-              <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
-                <div className="mb-3 flex items-center justify-between">
-                  <div>
-                    <p className="text-sm font-semibold text-stone-900">Quote Summary</p>
-                    <p className="text-xs text-stone-500">Hidden yard routing included</p>
-                  </div>
-                  <div className="rounded-full bg-stone-100 px-3 py-1 text-xs font-bold text-stone-700">
-                    {isCalculating ? 'Calculating…' : 'Ready'}
-                  </div>
-                </div>
-
-                <div className="grid gap-3 rounded-2xl bg-stone-50 p-3">
-                  <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2">
-                    <span className="text-sm text-stone-600">Loaded Distance</span>
-                    <span className="font-semibold">{formatKm(routeSummary.loadedDistanceKm)}</span>
-                  </div>
-                  <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2">
-                    <span className="text-sm text-stone-600">Deadhead Distance</span>
-                    <span className="font-semibold">{formatKm(routeSummary.deadheadDistanceKm)}</span>
-                  </div>
-                  <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2">
-                    <span className="text-sm text-stone-600">Estimated Drive Time</span>
-                    <span className="font-semibold">{routeSummary.driveTimeMinutes} min</span>
-                  </div>
-                  <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2">
-                    <span className="text-sm text-stone-600">Loaded Cost</span>
-                    <span className="font-semibold">{formatCurrency(routeSummary.loadedCost)}</span>
-                  </div>
-                  <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2">
-                    <span className="text-sm text-stone-600">Deadhead Cost</span>
-                    <span className="font-semibold">{formatCurrency(routeSummary.deadheadCost)}</span>
-                  </div>
-                  <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2">
-                    <span className="text-sm text-stone-600">Minimum Charge Adjustment</span>
-                    <span className="font-semibold">{formatCurrency(routeSummary.minimumChargeAdjustment)}</span>
-                  </div>
-                  <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2">
-                    <span className="text-sm text-stone-600">Subtotal</span>
-                    <span className="font-semibold">{formatCurrency(routeSummary.subtotal)}</span>
-                  </div>
-                  <div className="flex items-center justify-between rounded-xl bg-white px-3 py-2">
-                    <span className="text-sm text-stone-600">GST</span>
-                    <span className="font-semibold">{formatCurrency(routeSummary.gst)}</span>
-                  </div>
-                  <div className="flex items-center justify-between rounded-xl bg-amber-50 px-3 py-2">
-                    <span className="text-sm font-semibold text-stone-700">Grand Total</span>
-                    <span className="text-lg font-bold text-amber-900">{formatCurrency(routeSummary.total)}</span>
-                  </div>
-                </div>
-
-                <div className="mt-4 rounded-2xl bg-amber-50 p-3 ring-1 ring-amber-200">
-                  <p className="text-sm font-bold text-amber-900">Internal Business Information</p>
-                  <p className="mt-1 text-xs text-amber-800">This information is for FWF Hauling only.</p>
-                  <div className="mt-3 grid gap-2 rounded-xl bg-white p-2">
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="text-stone-600">Deadhead Fuel Used</span>
-                      <span className="font-semibold">{internalBusinessSummary.deadheadFuelUsed.toFixed(2)} L</span>
-                    </div>
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="text-stone-600">Loaded Fuel Used</span>
-                      <span className="font-semibold">{internalBusinessSummary.loadedFuelUsed.toFixed(2)} L</span>
-                    </div>
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="text-stone-600">Total Fuel Used</span>
-                      <span className="font-semibold">{internalBusinessSummary.totalFuelUsed.toFixed(2)} L</span>
-                    </div>
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="text-stone-600">Estimated Fuel Cost</span>
-                      <span className="font-semibold">{formatCurrency(internalBusinessSummary.estimatedFuelCost)}</span>
-                    </div>
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="text-stone-600">Estimated Gross Profit</span>
-                      <span className="font-semibold">{formatCurrency(internalBusinessSummary.estimatedGrossProfit)}</span>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-4 grid gap-2 sm:grid-cols-2">
-                  <button
-                    type="button"
-                    onClick={saveQuote}
-                    disabled={!canSaveQuote}
-                    className="rounded-2xl bg-amber-900 px-4 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    Save Quote
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => copyQuote()}
-                    className="rounded-2xl bg-stone-900 px-4 py-3 text-sm font-semibold text-white"
-                  >
-                    Copy Quote
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => shareQuote()}
-                    className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800"
-                  >
-                    Share Quote
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => generatePdf()}
-                    className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800"
-                  >
-                    Export PDF
-                  </button>
-                </div>
-              </section>
-
               <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
                 <div className="mb-3 flex items-center gap-2 rounded-2xl bg-stone-100 p-3">
                   <BuildingOffice2Icon className="h-5 w-5 text-amber-900" />
@@ -1676,7 +1436,23 @@ function App() {
                 <p className="rounded-2xl bg-stone-50 px-3 py-4 text-sm text-stone-700">{settings.yardAddress}</p>
               </section>
             </aside>
-          </div>
+            </div>
+
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => (installPromptEvent ? installPromptEvent.prompt() : undefined)}
+                className="rounded-full bg-amber-900 px-4 py-2 text-sm font-semibold text-white"
+              >
+                Install App
+              </button>
+              {googleReady && (
+                <span className="rounded-full bg-emerald-100 px-3 py-2 text-xs font-semibold text-emerald-700">
+                  Google Places ready
+                </span>
+              )}
+            </div>
+          </>
         )}
 
         {activePage === 'history' && (
@@ -1725,13 +1501,6 @@ function App() {
                         className="rounded-full bg-stone-200 px-3 py-2 text-xs font-semibold text-stone-800"
                       >
                         Share
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => generatePdf(quote)}
-                        className="rounded-full bg-stone-200 px-3 py-2 text-xs font-semibold text-stone-800"
-                      >
-                        PDF
                       </button>
                       <button
                         type="button"
