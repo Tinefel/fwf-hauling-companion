@@ -12,12 +12,9 @@
   "dependencies": {
     "@googlemaps/js-api-loader": "^2.1.1",
     "@heroicons/react": "^2.2.0",
-    "heic2any": "^0.0.4",
     "jspdf": "^4.2.1",
-    "pdfjs-dist": "^6.2.108",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "tesseract.js": "^7.0.0"
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
