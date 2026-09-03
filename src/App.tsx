@@ -81,22 +81,14 @@ type SpeechRecognitionLike = {
   start: () => void
 }
 type SpeechRecognitionConstructor = new () => SpeechRecognitionLike
-type GooglePrediction = { description: string; types?: string[] }
-type GooglePlacesService = {
-  getPlacePredictions: (
-    request: { input: string; componentRestrictions: { country: string }; sessionToken: object | null },
-    callback: (predictions: GooglePrediction[] | null, status: string) => void,
-  ) => void
+type GoogleAutocompleteSuggestion = {
+  placePrediction?: { text?: { text?: string } }
 }
-type GoogleApi = {
-  maps: {
-    places: {
-      AutocompleteService: new () => GooglePlacesService
-      AutocompleteSessionToken: new () => object
-      Autocomplete: unknown
-      PlacesServiceStatus: { OK: string }
-    }
+type GooglePlacesLibrary = {
+  AutocompleteSuggestion: {
+    fetchAutocompleteSuggestions: (request: { input: string; includedRegionCodes?: string[]; sessionToken?: object | null }) => Promise<{ suggestions: GoogleAutocompleteSuggestion[] }>
   }
+  AutocompleteSessionToken: new () => object
 }
 type BeforeInstallPromptEvent = Event & { prompt: () => Promise<void> }
 
@@ -104,8 +96,6 @@ declare global {
   interface Window {
     webkitSpeechRecognition?: SpeechRecognitionConstructor
     SpeechRecognition?: SpeechRecognitionConstructor
-    google?: GoogleApi
-    __fwfSessionToken?: object
   }
 }
 
@@ -146,9 +136,11 @@ const DEFAULT_ROUTE_SUMMARY: RouteSummary = {
 
 const GOOGLE_MAPS_API_KEY = (import.meta.env.VITE_GOOGLE_MAPS_API_KEY ?? '').trim()
 let googleMapsLoadPromise: Promise<void> | null = null
+let googlePlacesLibrary: GooglePlacesLibrary | null = null
+let googleSessionToken: object | null = null
 
 const ensureGoogleMapsReady = async () => {
-  if (window.google?.maps?.places?.AutocompleteService) {
+  if (googlePlacesLibrary?.AutocompleteSuggestion) {
     return
   }
 
@@ -170,9 +162,9 @@ const ensureGoogleMapsReady = async () => {
     })
 
     await importLibrary('maps')
-    await importLibrary('places')
+    googlePlacesLibrary = await importLibrary('places') as unknown as GooglePlacesLibrary
 
-    if (!window.google?.maps?.places?.AutocompleteService) {
+    if (!googlePlacesLibrary.AutocompleteSuggestion) {
       throw new Error('Google Places failed to initialize')
     }
   })()
@@ -187,78 +179,52 @@ const ensureGoogleMapsReady = async () => {
 
 
 const getSessionToken = () => {
-  if (!window.google?.maps?.places?.AutocompleteSessionToken) {
+  if (!googlePlacesLibrary?.AutocompleteSessionToken) {
     return null
   }
 
-  if (!window.__fwfSessionToken) {
-    window.__fwfSessionToken = new window.google.maps.places.AutocompleteSessionToken()
+  if (!googleSessionToken) {
+    googleSessionToken = new googlePlacesLibrary.AutocompleteSessionToken()
   }
 
-  return window.__fwfSessionToken
+  return googleSessionToken
 }
 
 const fetchAddressSuggestions = async (query: string) => {
   const trimmed = query.trim()
-  const hasGoogleService = !!window.google?.maps?.places?.AutocompleteService
 
   console.log('[places] fetchAddressSuggestions', {
     trimmed,
-    hasGoogleService,
-    hasGoogle: !!window.google,
-    hasMaps: !!window.google?.maps,
-    hasPlaces: !!window.google?.maps?.places,
+    hasAutocompleteSuggestion: !!googlePlacesLibrary?.AutocompleteSuggestion,
   })
 
   if (!trimmed || trimmed.length < 2) {
     return []
   }
 
-  if (hasGoogleService) {
-    const googleApi = window.google
-    if (!googleApi) return []
-    const service = new googleApi.maps.places.AutocompleteService()
-    const sessionToken = getSessionToken()
-
-    return await new Promise<string[]>((resolve) => {
-      service.getPlacePredictions(
-        {
-          input: trimmed,
-          componentRestrictions: { country: 'CA' },
-          sessionToken,
-        },
-        (
-          predictions: Array<{ description: string; types?: string[] }> | null,
-          status: string,
-        ) => {
-          console.log('[places] raw Google response', {
-            query: trimmed,
-            status,
-            count: predictions?.length ?? 0,
-            first: predictions?.[0]?.description ?? null,
-          })
-
-          if (status === googleApi.maps.places.PlacesServiceStatus.OK && predictions) {
-            resolve(predictions.map((prediction) => prediction.description))
-            return
-          }
-
-          resolve([])
-        },
-      )
-    })
+  if (googlePlacesLibrary?.AutocompleteSuggestion) {
+    try {
+      const response = await googlePlacesLibrary.AutocompleteSuggestion.fetchAutocompleteSuggestions({
+        input: trimmed,
+        includedRegionCodes: ['ca'],
+        sessionToken: getSessionToken(),
+      })
+      const predictions = response.suggestions
+        .map((suggestion) => suggestion.placePrediction?.text?.text ?? '')
+        .filter(Boolean)
+      console.log('[places] raw Google response', {
+        query: trimmed,
+        count: predictions.length,
+        first: predictions[0] ?? null,
+      })
+      return predictions
+    } catch (error) {
+      console.error('[places] AutocompleteSuggestion failed', error)
+      return []
+    }
   }
 
-  const response = await fetch(
-    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&q=${encodeURIComponent(trimmed)}`,
-  )
-
-  if (!response.ok) {
-    return []
-  }
-
-  const results = (await response.json()) as Array<{ display_name: string }>
-  return results.map((result) => result.display_name)
+  return []
 }
 
 const resolvePlaceAddress = async (query: string) => {
@@ -267,50 +233,8 @@ const resolvePlaceAddress = async (query: string) => {
     return ''
   }
 
-  if (window.google?.maps?.places?.AutocompleteService) {
-    const googleApi = window.google
-    if (!googleApi) return trimmed
-    const service = new googleApi.maps.places.AutocompleteService()
-    const sessionToken = getSessionToken()
-
-    return await new Promise<string>((resolve) => {
-      service.getPlacePredictions(
-        {
-          input: trimmed,
-          componentRestrictions: { country: 'CA' },
-          sessionToken,
-        },
-        (
-          predictions: Array<{ description: string; types?: string[] }> | null,
-          status: string,
-        ) => {
-          if (status === googleApi.maps.places.PlacesServiceStatus.OK && predictions?.length) {
-            const winner = predictions[0].description
-            console.log('[places] resolvePlaceAddress callback', {
-              status,
-              query: trimmed,
-              first: winner,
-            })
-            resolve(winner)
-            return
-          }
-
-          resolve(trimmed)
-        },
-      )
-    })
-  }
-
-  const response = await fetch(
-    `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(trimmed)}`,
-  )
-
-  if (!response.ok) {
-    return trimmed
-  }
-
-  const results = (await response.json()) as Array<{ display_name: string }>
-  return results[0]?.display_name ?? trimmed
+  const predictions = await fetchAddressSuggestions(trimmed)
+  return predictions[0] ?? trimmed
 }
 
 const formatCurrency = (amount: number) =>
@@ -709,8 +633,7 @@ function App() {
     const loadGoogle = async () => {
       console.log('[google] loadGoogle start', {
         hasKey: !!GOOGLE_MAPS_API_KEY,
-        hasGoogle: !!window.google,
-        hasMaps: !!window.google?.maps,
+        hasPlacesLibrary: !!googlePlacesLibrary,
       })
 
       if (!GOOGLE_MAPS_API_KEY) {
@@ -723,11 +646,8 @@ function App() {
         await ensureGoogleMapsReady()
 
         console.log('[google] script ready', {
-          hasGoogle: !!window.google,
-          hasMaps: !!window.google?.maps,
-          hasPlaces: !!window.google?.maps?.places,
-          hasAutocomplete: !!window.google?.maps?.places?.Autocomplete,
-          hasAutocompleteService: !!window.google?.maps?.places?.AutocompleteService,
+          hasPlacesLibrary: !!googlePlacesLibrary,
+          hasAutocompleteSuggestion: !!googlePlacesLibrary?.AutocompleteSuggestion,
         })
 
         const validationResponse = await fetch(
