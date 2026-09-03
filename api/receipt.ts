@@ -33,6 +33,8 @@ const receiptSchema = {
 
 const prompt = `Analyze this Canadian receipt image and return only the requested JSON object. Read merchant/store name and address, Canadian date, subtotal, explicitly stated GST and PST, final amount charged, receipt or invoice numbers, category, payment method, and line items. Do not guess: use null when a value is not visible or cannot be confidently determined. Preserve decimal amounts accurately. Distinguish the final total from item amounts. Categories include fuel, vehicle repairs, parts, tires, tools, insurance, food, office expenses, and other. Handle angled, shadowed, wrinkled, unevenly lit, or slightly blurry photographs and small text. Use currency CAD unless the receipt clearly shows another currency.`
 
+const GEMINI_REQUEST_TIMEOUT_MS = 25_000
+
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
 export default async function handler(request: Request) {
@@ -43,24 +45,31 @@ export default async function handler(request: Request) {
   try {
     const body = await request.json() as { mimeType?: string; data?: string }
     if (!body.mimeType?.startsWith('image/') || !body.data) return jsonResponse({ error: 'An image is required' }, 400)
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: body.mimeType, data: body.data } }] as GeminiPart[] }],
-        generationConfig: {
-          responseMimeType: 'application/json',
-          responseSchema: receiptSchema,
-          temperature: 0,
-        },
-      }),
-    })
-    if (!response.ok) return jsonResponse({ error: 'Receipt service request failed' }, 502)
-    const result = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> }
-    const text = result.candidates?.[0]?.content?.parts?.find((part) => part.text)?.text
-    if (!text) return jsonResponse({ error: 'Receipt service returned no result' }, 502)
-    const receipt = JSON.parse(text)
-    return jsonResponse(receipt)
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS)
+    try {
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(apiKey)}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: body.mimeType, data: body.data } }] as GeminiPart[] }],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            responseSchema: receiptSchema,
+            temperature: 0,
+          },
+        }),
+        signal: controller.signal,
+      })
+      if (!response.ok) return jsonResponse({ error: 'Receipt service request failed' }, 502)
+      const result = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> }
+      const text = result.candidates?.[0]?.content?.parts?.find((part) => part.text)?.text
+      if (!text) return jsonResponse({ error: 'Receipt service returned no result' }, 502)
+      const receipt = JSON.parse(text)
+      return jsonResponse(receipt)
+    } finally {
+      clearTimeout(timeoutId)
+    }
   } catch {
     return jsonResponse({ error: 'Receipt service request failed' }, 502)
   }

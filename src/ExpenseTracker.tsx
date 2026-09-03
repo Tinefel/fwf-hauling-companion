@@ -590,6 +590,21 @@ const readImageText = async (source: Blob) => {
 
 const isHeicFile = (file: File) => /image\/(heic|heif)/i.test(file.type) || /\.(heic|heif)$/i.test(file.name)
 
+const RECEIPT_PROCESSING_TIMEOUT_MS = 45_000
+const GEMINI_REQUEST_TIMEOUT_MS = 25_000
+
+const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, message: string) => {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs)
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId)
+  }
+}
+
 const toOcrSource = async (file: File, updateDiagnostics?: (update: ReceiptDiagnosticUpdate) => void) => {
   receiptDebug('OCR source input', { name: file.name, type: file.type, bytes: file.size, heic: isHeicFile(file) })
   if (!isHeicFile(file)) {
@@ -707,9 +722,20 @@ const toGeminiImage = async (file: File) => {
 
 const readReceiptWithGemini = async (file: File) => {
   const image = await toGeminiImage(file)
-  const response = await fetch('/api/receipt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(image) })
-  if (!response.ok) throw new Error('Gemini receipt request failed')
-  return await response.json() as GeminiReceipt
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS)
+  try {
+    return await withTimeout((async () => {
+      const response = await fetch('/api/receipt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(image), signal: controller.signal })
+      if (!response.ok) throw new Error('Gemini receipt request failed')
+      return await response.json() as GeminiReceipt
+    })(), GEMINI_REQUEST_TIMEOUT_MS, 'Gemini receipt request timed out')
+  } catch (error) {
+    if (controller.signal.aborted) throw new Error('Gemini receipt request timed out', { cause: error })
+    throw error
+  } finally {
+    clearTimeout(timeoutId)
+  }
 }
 
 const geminiToDraft = (receipt: GeminiReceipt): Partial<ExpenseDraft> => ({
@@ -786,11 +812,11 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
     })
     const updateDiagnostics = (update: ReceiptDiagnosticUpdate) => setReceiptDiagnostics((current) => current ? { ...current, ...update } : current)
     try {
-      const attachmentDataPromise = readDataUrl(file)
+      const attachmentDataPromise = withTimeout(readDataUrl(file), RECEIPT_PROCESSING_TIMEOUT_MS, 'Receipt attachment timed out')
       let extracted: Partial<ExpenseDraft>
       let receiptWasReadable = false
       if (file.type === 'application/pdf') {
-        const receiptText = await readReceiptText(file, updateDiagnostics)
+        const receiptText = await withTimeout(readReceiptText(file, updateDiagnostics), RECEIPT_PROCESSING_TIMEOUT_MS, 'Receipt processing timed out')
         const parserText = typeof receiptText === 'string' ? receiptText : receiptText.text
         receiptWasReadable = Boolean(parserText.trim())
         updateDiagnostics({ parserReceivedText: parserText.trim() ? 'Yes' : 'No' })
@@ -798,11 +824,11 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
         extracted = extractExpenseFields(receiptText)
       } else {
         try {
-          extracted = geminiToDraft(await readReceiptWithGemini(file))
+          extracted = geminiToDraft(await withTimeout(readReceiptWithGemini(file), RECEIPT_PROCESSING_TIMEOUT_MS, 'Gemini receipt processing timed out'))
           receiptWasReadable = true
           updateDiagnostics({ tesseractInitialized: 'Not used (Gemini succeeded)', parserReceivedText: 'Yes' })
         } catch {
-          const receiptText = await readReceiptText(file, updateDiagnostics)
+          const receiptText = await withTimeout(readReceiptText(file, updateDiagnostics), RECEIPT_PROCESSING_TIMEOUT_MS, 'OCR receipt processing timed out')
           const parserText = typeof receiptText === 'string' ? receiptText : receiptText.text
           receiptWasReadable = Boolean(parserText.trim())
           updateDiagnostics({ parserReceivedText: parserText.trim() ? 'Yes' : 'No' })
