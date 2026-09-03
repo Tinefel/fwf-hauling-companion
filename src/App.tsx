@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowsUpDownIcon,
   BuildingOffice2Icon,
+  BanknotesIcon,
   ChevronDownIcon,
   ChevronUpIcon,
   ClockIcon,
@@ -12,6 +13,7 @@ import {
   TruckIcon,
 } from '@heroicons/react/24/outline'
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader'
+import ExpenseTracker, { type ExpenseRecord } from './ExpenseTracker'
 
 type RouteSummary = {
   loadedDistanceKm: number
@@ -70,12 +72,42 @@ type Settings = {
   dieselPrice: number
 }
 
+type SpeechRecognitionEventLike = { results: ArrayLike<ArrayLike<{ transcript: string }>> }
+type SpeechRecognitionLike = {
+  lang: string
+  interimResults: boolean
+  maxAlternatives: number
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null
+  onerror: ((event: { error?: string }) => void) | null
+  onstart: (() => void) | null
+  start: () => void
+}
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike
+type GooglePrediction = { description: string; types?: string[] }
+type GooglePlacesService = {
+  getPlacePredictions: (
+    request: { input: string; componentRestrictions: { country: string }; sessionToken: object | null },
+    callback: (predictions: GooglePrediction[] | null, status: string) => void,
+  ) => void
+}
+type GoogleApi = {
+  maps: {
+    places: {
+      AutocompleteService: new () => GooglePlacesService
+      AutocompleteSessionToken: new () => object
+      Autocomplete: unknown
+      PlacesServiceStatus: { OK: string }
+    }
+  }
+}
+type BeforeInstallPromptEvent = Event & { prompt: () => Promise<void> }
+
 declare global {
   interface Window {
-    webkitSpeechRecognition?: new () => any
-    SpeechRecognition?: new () => any
-    google?: any
-    __fwfSessionToken?: any
+    webkitSpeechRecognition?: SpeechRecognitionConstructor
+    SpeechRecognition?: SpeechRecognitionConstructor
+    google?: GoogleApi
+    __fwfSessionToken?: object
   }
 }
 
@@ -85,6 +117,7 @@ const STORAGE_KEYS = {
   recentPickup: 'fwf-hauling-recent-pickup',
   recentDropoff: 'fwf-hauling-recent-dropoff',
   customers: 'fwf-hauling-customers',
+  expenses: 'fwf-hauling-expenses',
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -185,7 +218,9 @@ const fetchAddressSuggestions = async (query: string) => {
   }
 
   if (hasGoogleService) {
-    const service = new window.google.maps.places.AutocompleteService()
+    const googleApi = window.google
+    if (!googleApi) return []
+    const service = new googleApi.maps.places.AutocompleteService()
     const sessionToken = getSessionToken()
 
     return await new Promise<string[]>((resolve) => {
@@ -206,7 +241,7 @@ const fetchAddressSuggestions = async (query: string) => {
             first: predictions?.[0]?.description ?? null,
           })
 
-          if (status === window.google.maps.places.PlacesServiceStatus.OK && predictions) {
+          if (status === googleApi.maps.places.PlacesServiceStatus.OK && predictions) {
             resolve(predictions.map((prediction) => prediction.description))
             return
           }
@@ -236,7 +271,9 @@ const resolvePlaceAddress = async (query: string) => {
   }
 
   if (window.google?.maps?.places?.AutocompleteService) {
-    const service = new window.google.maps.places.AutocompleteService()
+    const googleApi = window.google
+    if (!googleApi) return trimmed
+    const service = new googleApi.maps.places.AutocompleteService()
     const sessionToken = getSessionToken()
 
     return await new Promise<string>((resolve) => {
@@ -250,7 +287,7 @@ const resolvePlaceAddress = async (query: string) => {
           predictions: Array<{ description: string; types?: string[] }> | null,
           status: string,
         ) => {
-          if (status === window.google.maps.places.PlacesServiceStatus.OK && predictions?.length) {
+          if (status === googleApi.maps.places.PlacesServiceStatus.OK && predictions?.length) {
             const winner = predictions[0].description
             console.log('[places] resolvePlaceAddress callback', {
               status,
@@ -534,12 +571,15 @@ function App() {
   const [loadDescription, setLoadDescription] = useState('')
   const [trailerType, setTrailerType] = useState('')
   const [loadWeightLbs, setLoadWeightLbs] = useState('')
-  const [activePage, setActivePage] = useState<'home' | 'history' | 'settings'>('home')
+  const [activePage, setActivePage] = useState<'home' | 'history' | 'expenses' | 'settings'>('home')
+  const [expenses, setExpenses] = useState<ExpenseRecord[]>(() =>
+    readJson<ExpenseRecord[]>(STORAGE_KEYS.expenses, []),
+  )
   const [routeSummary, setRouteSummary] = useState<RouteSummary>(DEFAULT_ROUTE_SUMMARY)
   const [searchTerm, setSearchTerm] = useState('')
   const [isCalculating, setIsCalculating] = useState(false)
   const [googleReady, setGoogleReady] = useState(false)
-  const [installPromptEvent, setInstallPromptEvent] = useState<any>(null)
+  const [installPromptEvent, setInstallPromptEvent] = useState<BeforeInstallPromptEvent | null>(null)
   const [isAdditionalDetailsOpen, setIsAdditionalDetailsOpen] = useState(false)
   const [isMoreFuelDetailsOpen, setIsMoreFuelDetailsOpen] = useState(false)
   const [isRecentPickupOpen, setIsRecentPickupOpen] = useState(false)
@@ -672,6 +712,10 @@ function App() {
   }, [customers])
 
   useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.expenses, JSON.stringify(expenses))
+  }, [expenses])
+
+  useEffect(() => {
     const loadGoogle = async () => {
       console.log('[google] loadGoogle start', {
         hasKey: !!GOOGLE_MAPS_API_KEY,
@@ -771,7 +815,7 @@ function App() {
   useEffect(() => {
     const onBeforeInstallPrompt = (event: Event) => {
       event.preventDefault()
-      setInstallPromptEvent(event)
+      setInstallPromptEvent(event as BeforeInstallPromptEvent)
     }
 
     window.addEventListener('beforeinstallprompt', onBeforeInstallPrompt)
@@ -838,7 +882,7 @@ function App() {
     recognition.lang = 'en-US'
     recognition.interimResults = false
     recognition.maxAlternatives = 1
-    recognition.onresult = async (event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => {
+    recognition.onresult = async (event) => {
       const transcript = event.results[0][0].transcript.trim()
       console.log('[voice] transcript received', { transcript })
       if (!transcript) {
@@ -870,7 +914,7 @@ function App() {
     }
   }
 
-  const addRecentAddress = useCallback((address: string, type: 'pickup' | 'dropoff') => {
+  const addRecentAddress = (address: string, type: 'pickup' | 'dropoff') => {
     const trimmedAddress = address.trim()
     if (!trimmedAddress) {
       return
@@ -886,7 +930,7 @@ function App() {
     setRecentDropoffAddresses((current) =>
       [trimmedAddress, ...current.filter((entry) => entry !== trimmedAddress)].slice(0, 20),
     )
-  }, [])
+  }
 
   const swapAddresses = () => {
     const previousPickup = pickupAddress
@@ -1529,7 +1573,11 @@ function App() {
           </section>
         )}
 
-        <nav className="sticky bottom-3 mt-4 grid grid-cols-3 gap-2 rounded-2xl bg-white p-2 shadow-sm ring-1 ring-stone-200">
+        {activePage === 'expenses' && (
+          <ExpenseTracker expenses={expenses} onExpensesChange={setExpenses} />
+        )}
+
+        <nav className="sticky bottom-3 mt-4 grid grid-cols-4 gap-2 rounded-2xl bg-white p-2 shadow-sm ring-1 ring-stone-200">
           <button
             type="button"
             onClick={() => setActivePage('home')}
@@ -1549,6 +1597,16 @@ function App() {
           >
             <ClockIcon className="h-4 w-4" />
             History
+          </button>
+          <button
+            type="button"
+            onClick={() => setActivePage('expenses')}
+            className={`flex flex-col items-center gap-1 rounded-xl px-3 py-2 text-[11px] font-semibold ${
+              activePage === 'expenses' ? 'bg-amber-900 text-white' : 'text-stone-700'
+            }`}
+          >
+            <BanknotesIcon className="h-4 w-4" />
+            Expenses
           </button>
           <button
             type="button"
