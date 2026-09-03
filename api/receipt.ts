@@ -33,7 +33,20 @@ const receiptSchema = {
 
 const prompt = `Analyze this Canadian receipt image and return only the requested JSON object. Read merchant/store name and address, Canadian date, subtotal, explicitly stated GST and PST, final amount charged, receipt or invoice numbers, category, payment method, and line items. Do not guess: use null when a value is not visible or cannot be confidently determined. Preserve decimal amounts accurately. Distinguish the final total from item amounts. Categories include fuel, vehicle repairs, parts, tires, tools, insurance, food, office expenses, and other. Handle angled, shadowed, wrinkled, unevenly lit, or slightly blurry photographs and small text. Use currency CAD unless the receipt clearly shows another currency.`
 
-const GEMINI_REQUEST_TIMEOUT_MS = 25_000
+const GEMINI_REQUEST_TIMEOUT_MS = 20_000
+const REQUEST_BODY_TIMEOUT_MS = 5_000
+
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number) => {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error('Receipt request body timed out')), timeoutMs)
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId)
+  }
+}
 
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
@@ -43,7 +56,7 @@ export default async function handler(request: Request) {
   if (!apiKey) return jsonResponse({ error: 'Receipt service is not configured' }, 503)
 
   try {
-    const body = await request.json() as { mimeType?: string; data?: string }
+    const body = await withTimeout(request.json() as Promise<{ mimeType?: string; data?: string }>, REQUEST_BODY_TIMEOUT_MS)
     if (!body.mimeType?.startsWith('image/') || !body.data) return jsonResponse({ error: 'An image is required' }, 400)
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), GEMINI_REQUEST_TIMEOUT_MS)

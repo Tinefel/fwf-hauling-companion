@@ -727,7 +727,10 @@ const readReceiptWithGemini = async (file: File) => {
   try {
     return await withTimeout((async () => {
       const response = await fetch('/api/receipt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(image), signal: controller.signal })
-      if (!response.ok) throw new Error('Gemini receipt request failed')
+      if (!response.ok) {
+        const errorBody = await response.json().catch(() => null) as { error?: string } | null
+        throw new Error(errorBody?.error || 'Gemini receipt request failed')
+      }
       return await response.json() as GeminiReceipt
     })(), GEMINI_REQUEST_TIMEOUT_MS, 'Gemini receipt request timed out')
   } catch (error) {
@@ -788,6 +791,8 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   const [selectedExpense, setSelectedExpense] = useState<ExpenseRecord | null>(null)
   const [isProcessing, setIsProcessing] = useState(false)
   const [processingMessage, setProcessingMessage] = useState('')
+  const [receiptError, setReceiptError] = useState('')
+  const [retryFile, setRetryFile] = useState<File | null>(null)
   const [receiptDiagnostics, setReceiptDiagnostics] = useState<ReceiptDiagnostics | null>(null)
 
   const updateDraft = (field: keyof ExpenseDraft, value: string) => {
@@ -796,6 +801,9 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
 
   const selectReceipt = async (file: File) => {
     setIsProcessing(true)
+    setReceiptError('')
+    setRetryFile(file)
+    setDraft(null)
     setProcessingMessage('Reading receipt...')
     setReceiptDiagnostics({
       originalFileType: file.type || '(missing)',
@@ -823,18 +831,9 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
         receiptDebug('parser input', { kind: typeof receiptText, textLength: typeof receiptText === 'string' ? receiptText.length : receiptText.text.length, confidence: typeof receiptText === 'string' ? undefined : receiptText.confidence, wordCount: typeof receiptText === 'string' ? undefined : receiptText.lines.reduce((count, line) => count + line.words.length, 0) })
         extracted = extractExpenseFields(receiptText)
       } else {
-        try {
-          extracted = geminiToDraft(await withTimeout(readReceiptWithGemini(file), RECEIPT_PROCESSING_TIMEOUT_MS, 'Gemini receipt processing timed out'))
-          receiptWasReadable = true
-          updateDiagnostics({ tesseractInitialized: 'Not used (Gemini succeeded)', parserReceivedText: 'Yes' })
-        } catch {
-          const receiptText = await withTimeout(readReceiptText(file, updateDiagnostics), RECEIPT_PROCESSING_TIMEOUT_MS, 'OCR receipt processing timed out')
-          const parserText = typeof receiptText === 'string' ? receiptText : receiptText.text
-          receiptWasReadable = Boolean(parserText.trim())
-          updateDiagnostics({ parserReceivedText: parserText.trim() ? 'Yes' : 'No' })
-          receiptDebug('parser input', { kind: typeof receiptText, textLength: typeof receiptText === 'string' ? receiptText.length : receiptText.text.length, confidence: typeof receiptText === 'string' ? undefined : receiptText.confidence, wordCount: typeof receiptText === 'string' ? undefined : receiptText.lines.reduce((count, line) => count + line.words.length, 0) })
-          extracted = extractExpenseFields(receiptText)
-        }
+        extracted = geminiToDraft(await withTimeout(readReceiptWithGemini(file), RECEIPT_PROCESSING_TIMEOUT_MS, 'Gemini receipt processing timed out'))
+        receiptWasReadable = true
+        updateDiagnostics({ tesseractInitialized: 'Not used (Gemini succeeded)', parserReceivedText: 'Yes' })
       }
       const attachmentData = await attachmentDataPromise
       setDraft({
@@ -845,19 +844,9 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
         attachmentData,
       })
       setProcessingMessage(receiptWasReadable ? 'Receipt information found' : "Couldn't read some information from this receipt. Please review and enter the missing fields manually.")
-    } catch {
-      try {
-        const attachmentData = await readDataUrl(file)
-        setDraft({
-          ...emptyDraft,
-          attachmentName: file.name,
-          attachmentType: file.type || 'application/octet-stream',
-          attachmentData,
-        })
-      } catch {
-        setDraft(null)
-      }
-      setProcessingMessage("Couldn't read some information from this receipt. Please review and enter the missing fields manually.")
+    } catch (error) {
+      setReceiptError(error instanceof Error ? error.message : 'Receipt scanning failed. Please try again.')
+      setProcessingMessage('Receipt scanning failed.')
     } finally {
       setIsProcessing(false)
     }
@@ -1005,6 +994,12 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
           </label>
         </div>
         {isProcessing && <p className="mt-4 text-sm text-stone-500">Processing receipt...</p>}
+        {receiptError && (
+          <div className="mt-4 flex flex-wrap items-center gap-3 text-sm text-red-700">
+            <p>{receiptError}</p>
+            {retryFile && <button type="button" onClick={() => selectReceipt(retryFile)} className="rounded-xl bg-red-100 px-3 py-2 font-semibold text-red-800">Retry</button>}
+          </div>
+        )}
       </div>
 
       <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
