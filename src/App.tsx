@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowsUpDownIcon,
+  BanknotesIcon,
   BuildingOffice2Icon,
   ChevronDownIcon,
   ChevronUpIcon,
@@ -12,6 +13,7 @@ import {
   TruckIcon,
 } from '@heroicons/react/24/outline'
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader'
+import ExpenseTracker, { type ExpenseRecord } from './ExpenseTracker'
 
 type RouteSummary = {
   loadedDistanceKm: number
@@ -105,6 +107,7 @@ const STORAGE_KEYS = {
   recentPickup: 'fwf-hauling-recent-pickup',
   recentDropoff: 'fwf-hauling-recent-dropoff',
   customers: 'fwf-hauling-customers',
+  expenses: 'fwf-hauling-expenses',
 }
 
 const DEFAULT_SETTINGS: Settings = {
@@ -492,7 +495,8 @@ function App() {
   const [loadDescription, setLoadDescription] = useState('')
   const [trailerType, setTrailerType] = useState('')
   const [loadWeightLbs, setLoadWeightLbs] = useState('')
-  const [activePage, setActivePage] = useState<'home' | 'history' | 'settings'>('home')
+  const [activePage, setActivePage] = useState<'home' | 'history' | 'expenses' | 'settings'>('home')
+  const [expenses, setExpenses] = useState<ExpenseRecord[]>(() => readJson<ExpenseRecord[]>(STORAGE_KEYS.expenses, []))
   const [routeSummary, setRouteSummary] = useState<RouteSummary>(DEFAULT_ROUTE_SUMMARY)
   const [searchTerm, setSearchTerm] = useState('')
   const [isCalculating, setIsCalculating] = useState(false)
@@ -628,6 +632,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.customers, JSON.stringify(customers))
   }, [customers])
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.expenses, JSON.stringify(expenses))
+  }, [expenses])
 
   useEffect(() => {
     const loadGoogle = async () => {
@@ -1483,7 +1491,11 @@ function App() {
           </section>
         )}
 
-        <nav className="sticky bottom-3 mt-4 grid grid-cols-3 gap-2 rounded-2xl bg-white p-2 shadow-sm ring-1 ring-stone-200">
+        {activePage === 'expenses' && (
+          <ExpenseTracker expenses={expenses} onExpensesChange={setExpenses} />
+        )}
+
+        <nav className="sticky bottom-3 mt-4 grid grid-cols-4 gap-2 rounded-2xl bg-white p-2 shadow-sm ring-1 ring-stone-200">
           <button
             type="button"
             onClick={() => setActivePage('home')}
@@ -1513,6 +1525,16 @@ function App() {
           >
             <Cog6ToothIcon className="h-4 w-4" />
             Settings
+          </button>
+          <button
+            type="button"
+            onClick={() => setActivePage('expenses')}
+            className={`flex flex-col items-center gap-1 rounded-xl px-3 py-2 text-[11px] font-semibold ${
+              activePage === 'expenses' ? 'bg-amber-900 text-white' : 'text-stone-700'
+            }`}
+          >
+            <BanknotesIcon className="h-4 w-4" />
+            Expenses
           </button>
         </nav>
 

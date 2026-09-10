@@ -12,7 +12,9 @@
   "dependencies": {
     "@googlemaps/js-api-loader": "^2.1.1",
     "@heroicons/react": "^2.2.0",
+    "@napi-rs/canvas": "^1.0.8",
     "jspdf": "^4.2.1",
+    "pdfjs-dist": "^6.3.289",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
