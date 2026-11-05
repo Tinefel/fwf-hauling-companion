@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { CameraIcon, CheckCircleIcon, DocumentArrowUpIcon, DocumentTextIcon, PencilSquareIcon, PhotoIcon, ReceiptPercentIcon } from '@heroicons/react/24/outline'
+import { CameraIcon, CheckCircleIcon, DocumentArrowUpIcon, DocumentTextIcon, PencilSquareIcon, PhotoIcon, ReceiptPercentIcon, TruckIcon } from '@heroicons/react/24/outline'
 import type { ExtractedReceipt, ReceiptApiResponse, ReceiptTimings } from './receiptTypes'
 
 type ExpenseRecord = {
@@ -86,7 +86,9 @@ type ScanStage = 'compressing' | 'uploading' | 'reading' | 'done'
 type ScanProgress = { stage: ScanStage; uploadFraction: number }
 type ScanState = ScanProgress & { fileName: string; isPdf: boolean; previewUrl: string | null }
 const STAGE_LABELS: Record<ScanStage, string> = { compressing: 'Compressing…', uploading: 'Uploading…', reading: 'Reading receipt…', done: 'Done' }
-const DONE_PAUSE_MS = 400
+// How long "Done" shows before the review form opens: the truck animation (~1800ms), or 400ms with reduced motion.
+const DONE_ANIMATION_MS = 1800
+const DONE_REDUCED_MOTION_MS = 400
 
 // XMLHttpRequest instead of fetch because only XHR reports upload progress.
 const postReceipt = (body: string, onUploadProgress: (fraction: number) => void, timeoutMessage: string) =>
@@ -167,13 +169,29 @@ const scanReceipt = async (file: File, onProgress: (progress: ScanProgress) => v
   }
 }
 
-function ScanProgressBar({ value }: { value: number | null }) {
+function ScanProgressBar({ value, celebrate = false }: { value: number | null; celebrate?: boolean }) {
   const percent = value == null ? undefined : Math.round(value * 100)
   return (
-    <div role="progressbar" aria-label="Scan progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} className="h-1.5 w-full overflow-hidden rounded-full bg-stone-200">
-      {value == null
-        ? <div className="h-full w-1/3 rounded-full bg-amber-800 motion-safe:animate-receipt-indeterminate motion-reduce:w-full motion-reduce:opacity-60" />
-        : <div className="h-full rounded-full bg-amber-800 transition-[width] duration-200 motion-reduce:transition-none" style={{ width: `${percent ?? 0}%` }} />}
+    <div className="relative">
+      <div role="progressbar" aria-label="Scan progress" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} className="h-1.5 w-full overflow-hidden rounded-full bg-stone-200">
+        {value == null
+          ? <div className="h-full w-1/3 rounded-full bg-amber-800 motion-safe:animate-receipt-indeterminate motion-reduce:w-full motion-reduce:opacity-60" />
+          : celebrate
+            // The truck pulls the fill to 100%; reduced motion just shows it full.
+            ? <div className="h-full w-full rounded-full bg-amber-800 motion-safe:animate-receipt-truck-fill" />
+            : <div className="h-full rounded-full bg-amber-800 transition-[width] duration-200 motion-reduce:transition-none" style={{ width: `${percent ?? 0}%` }} />}
+      </div>
+      {celebrate && (
+        // Taller than the track and clipped at its edges, so the truck drives along it and exits off the right.
+        <div aria-hidden="true" className="pointer-events-none absolute inset-x-0 bottom-0 h-5 overflow-hidden motion-reduce:hidden">
+          <div className="absolute bottom-0.5 motion-safe:animate-receipt-truck-drive">
+            <span className="absolute -left-1 bottom-0.5 h-1.5 w-1.5 rounded-full bg-stone-400/70 motion-safe:animate-receipt-dust" />
+            <span className="absolute -left-2.5 bottom-1 h-1 w-1 rounded-full bg-stone-400/60 motion-safe:animate-receipt-dust" style={{ animationDelay: '280ms' }} />
+            <span className="absolute -left-1.5 bottom-0 h-1 w-1 rounded-full bg-stone-400/50 motion-safe:animate-receipt-dust" style={{ animationDelay: '560ms' }} />
+            <TruckIcon className="h-4 w-4 text-amber-800" />
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -198,9 +216,9 @@ function ScanStatus({ scan }: { scan: ScanState }) {
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm font-semibold text-stone-900">{scan.fileName}</p>
         <p aria-live="polite" className={`mt-1 flex items-center gap-1.5 text-sm ${isDone ? 'font-semibold text-emerald-700' : 'text-stone-600'}`}>
-          {isDone && <CheckCircleIcon className="h-4 w-4" />}{STAGE_LABELS[scan.stage]}
+          {isDone && <CheckCircleIcon className="h-4 w-4 motion-safe:animate-receipt-check-pop" />}{STAGE_LABELS[scan.stage]}
         </p>
-        <div className="mt-3"><ScanProgressBar value={progress} /></div>
+        <div className="mt-3"><ScanProgressBar value={progress} celebrate={isDone} /></div>
       </div>
     </div>
   )
@@ -247,7 +265,8 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
       const onProgress = (progress: ScanProgress) => setScan((current) => current ? { ...current, ...progress } : current)
       const [receipt, attachmentData] = await Promise.all([scanReceipt(file, onProgress), withTimeout(readDataUrl(file), CLIENT_TIMEOUT_MS, 'Attaching receipt timed out')])
       setScan((current) => current ? { ...current, stage: 'done', uploadFraction: 1 } : current)
-      await new Promise<void>((resolve) => { setTimeout(resolve, DONE_PAUSE_MS) })
+      const donePauseMs = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? DONE_REDUCED_MOTION_MS : DONE_ANIMATION_MS
+      await new Promise<void>((resolve) => { setTimeout(resolve, donePauseMs) })
       setDraft({ ...emptyDraft, ...receiptToDraft(receipt, isPdf), attachmentName: file.name, attachmentType: file.type || 'application/octet-stream', attachmentData })
       setProcessingMessage('Receipt information found. Review the fields before saving.')
     } catch (error) {

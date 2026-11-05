@@ -14,6 +14,33 @@
     0% { transform: translateX(-100%); }
     100% { transform: translateX(300%); }
   }
+
+  /* Success: truck drives across the bar (0–1520ms), check mark pops in as it exits (1360–1800ms). */
+  --animate-receipt-truck-drive: receipt-truck-drive 1520ms cubic-bezier(0.45, 0, 0.55, 1) both;
+  --animate-receipt-truck-fill: receipt-truck-fill 1520ms cubic-bezier(0.45, 0, 0.55, 1) both;
+  --animate-receipt-dust: receipt-dust 840ms ease-out infinite;
+  --animate-receipt-check-pop: receipt-check-pop 440ms ease-out 1360ms both;
+
+  @keyframes receipt-truck-drive {
+    from { left: -1.25rem; }
+    to { left: 100%; }
+  }
+
+  @keyframes receipt-truck-fill {
+    from { width: 0%; }
+    to { width: 100%; }
+  }
+
+  @keyframes receipt-dust {
+    0% { opacity: 0.8; transform: translate(0, 0) scale(0.6); }
+    100% { opacity: 0; transform: translate(-7px, -3px) scale(1.6); }
+  }
+
+  @keyframes receipt-check-pop {
+    0% { opacity: 0; transform: scale(0); }
+    65% { opacity: 1; transform: scale(1.15); }
+    100% { opacity: 1; transform: scale(1); }
+  }
 }
 
 :root {
