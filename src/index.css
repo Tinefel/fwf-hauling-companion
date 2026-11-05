@@ -1,5 +1,21 @@
 @import 'tailwindcss';
 
+/* Receipt scan feedback (used with motion-safe: so prefers-reduced-motion gets a static state). */
+@theme {
+  --animate-receipt-scan: receipt-scan 1.8s ease-in-out infinite;
+  --animate-receipt-indeterminate: receipt-indeterminate 1.2s ease-in-out infinite;
+
+  @keyframes receipt-scan {
+    0%, 100% { top: 0; }
+    50% { top: calc(100% - 2px); }
+  }
+
+  @keyframes receipt-indeterminate {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(300%); }
+  }
+}
+
 :root {
   font-family: Inter, 'Segoe UI', sans-serif;
   line-height: 1.5;

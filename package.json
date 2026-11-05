@@ -5,16 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:full": "vercel dev",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.5.0",
     "@googlemaps/js-api-loader": "^2.1.1",
     "@heroicons/react": "^2.2.0",
-    "@napi-rs/canvas": "^1.0.8",
     "jspdf": "^4.2.1",
-    "pdfjs-dist": "^6.3.289",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

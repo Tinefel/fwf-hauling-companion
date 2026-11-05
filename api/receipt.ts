@@ -1,29 +1,31 @@
-import { createCanvas } from '@napi-rs/canvas'
-import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
-import type { GeminiAttemptOutcome, ReceiptTimings } from '../src/receiptTimings.js'
+import Anthropic from '@anthropic-ai/sdk'
+import type { ClaudeCallOutcome, ExtractedReceipt, ReceiptCategory, ReceiptPaymentMethod, ReceiptTimings } from '../src/receiptTypes.js'
 
-type GeminiPart = { inlineData: { mimeType: string; data: string } } | { text: string }
+// Claude picks a short code; we map it back to the label the form shows.
+const CATEGORY_CODES = {
+  fuel: 'Fuel / Gas', repairs: 'Maintenance & Repairs', tires: 'Tires', parts: 'Parts', vehicle: 'Vehicle / Truck', insurance: 'Insurance',
+  licensing: 'Registration / Licensing', tolls: 'Tolls', office: 'Office', phone: 'Phone / Communications', supplies: 'Supplies', meals: 'Meals',
+  professional: 'Professional Services', advertising: 'Advertising / Marketing', trailer: 'Trailer', equipment: 'Equipment', other: 'Miscellaneous',
+} as const satisfies Record<string, ReceiptCategory>
+type CategoryCode = keyof typeof CATEGORY_CODES
+// Fails to compile if any ReceiptCategory has no code (the missing label becomes a required key).
+const categoriesWithoutCode: Record<Exclude<ReceiptCategory, (typeof CATEGORY_CODES)[CategoryCode]>, never> = {}
+void categoriesWithoutCode
+const PAYMENT_CODES = {
+  card: 'Credit card', debit: 'Debit', cash: 'Cash', cheque: 'Cheque', etransfer: 'E-transfer', on_account: 'On account', other: 'Other',
+} as const satisfies Record<string, ReceiptPaymentMethod>
+type PaymentCode = keyof typeof PAYMENT_CODES
 
-type ReceiptResponse = {
-  merchant: string | null
-  date: string | null
-  subtotal: number | null
-  gst: number | null
-  pst: number | null
-  total: number | null
-  receiptNumber: string | null
-  category: string | null
-  paymentMethod: string | null
-  currency: string | null
-  lineItems: Array<{
-    description: string | null
-    quantity: number | null
-    unitPrice: number | null
-    amount: number | null
-  }>
-}
+// Give the function room beyond the 15 s Claude timeout so it can return a clear error.
+export const maxDuration = 30
 
-export const normalizeReceiptAmounts = (receipt: ReceiptResponse) => {
+const CLAUDE_MODEL = 'claude-haiku-5-5'
+const CLAUDE_TIMEOUT_MS = 15_000
+const BODY_TIMEOUT_MS = 5_000
+const IMAGE_MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'] as const
+type ImageMediaType = typeof IMAGE_MEDIA_TYPES[number]
+
+export const normalizeReceiptAmounts = (receipt: ExtractedReceipt): ExtractedReceipt => {
   const total = typeof receipt.total === 'number' && Number.isFinite(receipt.total) && receipt.total >= 0 ? receipt.total : null
   const isPlausibleTax = (value: number | null) => value == null || (Number.isFinite(value) && value >= 0 && (total == null || value <= total))
   const gst = isPlausibleTax(receipt.gst) ? receipt.gst : null
@@ -43,65 +45,60 @@ export const normalizeReceiptAmounts = (receipt: ReceiptResponse) => {
   }
 }
 
-const receiptSchema = {
-  type: 'OBJECT',
-  properties: {
-    merchant: { type: 'STRING', nullable: true },
-    date: { type: 'STRING', nullable: true, description: 'Return visible dates as YYYY-MM-DD. For numeric dates, interpret month/day/year order, so 06/11/2026 means 2026-06-11.' },
-    subtotal: { type: 'NUMBER', nullable: true },
-    gst: { type: 'NUMBER', nullable: true },
-    pst: { type: 'NUMBER', nullable: true },
-    total: { type: 'NUMBER', nullable: true },
-    receiptNumber: { type: 'STRING', nullable: true },
-    invoiceNumber: { type: 'STRING', nullable: true },
-    category: {
-      type: 'STRING',
-      enum: ['Fuel / Gas', 'Maintenance & Repairs', 'Tires', 'Parts', 'Vehicle / Truck', 'Insurance', 'Registration / Licensing', 'Tolls', 'Office', 'Phone / Communications', 'Supplies', 'Meals', 'Professional Services', 'Advertising / Marketing', 'Trailer', 'Equipment', 'Miscellaneous'],
+const nullableString = { type: ['string', 'null'] }
+const nullableNumber = { type: ['number', 'null'] }
+
+// Only the fields the review form uses; no line items or free-text fields, to keep output short.
+const saveReceiptTool: Anthropic.Tool = {
+  name: 'save_receipt',
+  description: 'Save the receipt fields. Use null for anything not shown.',
+  strict: true,
+  input_schema: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      vendor: nullableString,
+      date: { ...nullableString, description: 'YYYY-MM-DD' },
+      receiptNumber: { ...nullableString, description: 'Invoice or receipt number' },
+      subtotal: nullableNumber,
+      gst: nullableNumber,
+      pst: nullableNumber,
+      total: nullableNumber,
+      paymentMethod: { anyOf: [{ type: 'string', enum: Object.keys(PAYMENT_CODES) }, { type: 'null' }] },
+      category: { type: 'string', enum: Object.keys(CATEGORY_CODES) },
     },
-    paymentMethod: { type: 'STRING', nullable: true },
-    currency: { type: 'STRING', nullable: true },
-    lineItems: {
-      type: 'ARRAY',
-      items: {
-        type: 'OBJECT',
-        properties: {
-          description: { type: 'STRING', nullable: true },
-          quantity: { type: 'NUMBER', nullable: true },
-          unitPrice: { type: 'NUMBER', nullable: true },
-          amount: { type: 'NUMBER', nullable: true },
-        },
-        required: ['description', 'quantity', 'unitPrice', 'amount'],
-      },
-    },
+    required: ['vendor', 'date', 'receiptNumber', 'subtotal', 'gst', 'pst', 'total', 'paymentMethod', 'category'],
   },
-  required: ['merchant', 'date', 'subtotal', 'gst', 'pst', 'total', 'receiptNumber', 'invoiceNumber', 'category', 'paymentMethod', 'currency', 'lineItems'],
 }
 
-const prompt = `Read the receipt image and return the requested JSON. Extract only visible information; never invent values. Interpret numeric dates as month/day/year and return them as YYYY-MM-DD, so 06/11/2026 means 2026-06-11. Return null when a date is unreadable. Select exactly one category from the allowed category values; use Miscellaneous if the category cannot be determined.
+const SYSTEM_PROMPT = `Extract Canadian receipts and invoices with save_receipt.
+- vendor: business name without Inc./Ltd.
+- gst = GST/HST amount; pst = PST/QST amount. Never use a tax registration number as an amount. subtotal + gst + pst = total.
+- Fuel receipts list litres and price per litre; those are not totals.
+- Numeric dates are month/day/year.
+- paymentMethod: on_account for charge / net-terms invoices.
+- category: repairs for shop labour or repair work (including on trailers).`
 
-Tax extraction is strict: distinguish GST, HST, PST, and QST registration numbers, business numbers, account numbers, phone numbers, and invoice/receipt numbers from transaction-level tax amounts. Never use an identification or registration number as a tax amount, even when it appears beside or underneath a GST/PST/HST label. Read actual amounts from the transaction/tax section and labels such as GST, HST, PST, QST, Tax, Taxes, Tax paid by customer, GST included, or PST included. If tax is explicitly included in the total, use the actual included tax amount shown on the receipt. If a tax is not charged or not shown, return 0 or null, never guess.
+// Runtime check of Claude's tool input against ExtractedReceipt (strict mode should guarantee it; this keeps the type honest).
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
+const isNullableString = (value: unknown): value is string | null => value === null || typeof value === 'string'
+const isNullableNumber = (value: unknown): value is number | null => value === null || (typeof value === 'number' && Number.isFinite(value))
+const isCategoryCode = (value: unknown): value is CategoryCode => typeof value === 'string' && Object.hasOwn(CATEGORY_CODES, value)
+const isPaymentCode = (value: unknown): value is PaymentCode => typeof value === 'string' && Object.hasOwn(PAYMENT_CODES, value)
 
-Validate the amounts against the receipt: subtotal plus GST plus PST should equal total within normal cent rounding. If the extracted tax values make that equation impossible, reject the values and re-examine the transaction/tax section. When total and actual included taxes are clear but subtotal is not printed, calculate subtotal as total minus those taxes. Do not invent taxes to make the equation work.`
-
-const GEMINI_TIMEOUT_MS = 9_000
-const GEMINI_ATTEMPT_TIMEOUT_MS = 7_000
-const PDF_GEMINI_TIMEOUT_MS = 40_000
-const PDF_GEMINI_ATTEMPT_TIMEOUT_MS = 20_000
-const BODY_TIMEOUT_MS = 5_000
-const GEMINI_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.5-flash']
-
-const renderPdfPages = async (data: string) => {
-  const document = await getDocument({ data: Uint8Array.from(Buffer.from(data, 'base64')) }).promise
-  const pages: GeminiPart[] = []
-  for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
-    const page = await document.getPage(pageNumber)
-    const viewport = page.getViewport({ scale: 1.5 })
-    const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height))
-    await page.render({ canvas: null, canvasContext: canvas.getContext('2d'), viewport }).promise
-    pages.push({ inlineData: { mimeType: 'image/png', data: canvas.toBuffer('image/png').toString('base64') } })
+export const parseExtractedReceipt = (input: unknown): ExtractedReceipt | null => {
+  if (!isRecord(input)) return null
+  const { vendor, date, subtotal, gst, pst, total, category, paymentMethod, receiptNumber } = input
+  if (!isNullableString(vendor) || !isNullableString(date) || !isNullableNumber(subtotal) || !isNullableNumber(gst) || !isNullableNumber(pst)
+    || !isNullableNumber(total) || !isCategoryCode(category) || !(paymentMethod === null || isPaymentCode(paymentMethod)) || !isNullableString(receiptNumber)) return null
+  return {
+    vendor, date, subtotal, gst, pst, total, receiptNumber,
+    category: CATEGORY_CODES[category],
+    paymentMethod: paymentMethod === null ? null : PAYMENT_CODES[paymentMethod],
   }
-  return pages
 }
+
+const isImageMediaType = (value: string): value is ImageMediaType => (IMAGE_MEDIA_TYPES as readonly string[]).includes(value)
 
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 
@@ -118,91 +115,90 @@ const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, message: 
 }
 
 export async function POST(request: Request) {
-  const apiKey = process.env.GEMINI_API_KEY?.trim()
-  if (!apiKey) return jsonResponse({ error: 'Receipt service is not configured. Check GEMINI_API_KEY.' }, 503)
+  const apiKey = process.env.ANTHROPIC_API_KEY?.trim()
+  if (!apiKey) return jsonResponse({ error: 'Receipt scanning is not configured: ANTHROPIC_API_KEY is not set on the server. Add it to .env.local (local) or the Vercel project settings (production).' }, 500)
 
   // Temporary diagnostics: every response below carries a `timings` object.
   const requestStartedAt = Date.now()
-  const timings: Omit<ReceiptTimings, 'serverTotalMs'> = { bodyBytes: 0, bodyReadMs: 0, pdfRenderMs: null, geminiAttempts: [], parseMs: null }
+  const timings: Omit<ReceiptTimings, 'serverTotalMs'> = { bodyBytes: 0, bodyReadMs: 0, claude: null, parseMs: null }
   const respond = (payload: object, status = 200) => {
     const finished: ReceiptTimings = { ...timings, serverTotalMs: Date.now() - requestStartedAt }
     console.log(`[receipt-timing] server ${JSON.stringify(finished)}`)
     return jsonResponse({ ...payload, timings: finished }, status)
   }
+
+  let body: { mimeType?: string; data?: string }
   try {
-    const rawBody = await withTimeout(request.arrayBuffer(), BODY_TIMEOUT_MS, 'Receipt request body timed out')
+    const rawBody = await withTimeout(request.arrayBuffer(), BODY_TIMEOUT_MS, 'Receipt upload timed out before it reached the server.')
     timings.bodyBytes = rawBody.byteLength
-    const body = JSON.parse(new TextDecoder().decode(rawBody)) as { mimeType?: string; data?: string }
+    body = JSON.parse(new TextDecoder().decode(rawBody)) as { mimeType?: string; data?: string }
     timings.bodyReadMs = Date.now() - requestStartedAt
-    if ((!body.mimeType?.startsWith('image/') && body.mimeType !== 'application/pdf') || !body.data) return respond({ error: 'A JPEG, PNG, HEIC, or PDF file is required.' }, 400)
-
-    const isPdf = body.mimeType === 'application/pdf'
-    const totalTimeoutMs = isPdf ? PDF_GEMINI_TIMEOUT_MS : GEMINI_TIMEOUT_MS
-    const attemptTimeoutMs = isPdf ? PDF_GEMINI_ATTEMPT_TIMEOUT_MS : GEMINI_ATTEMPT_TIMEOUT_MS
-    const pdfStartedAt = Date.now()
-    const pdfPages = isPdf ? await renderPdfPages(body.data) : null
-    if (isPdf) timings.pdfRenderMs = Date.now() - pdfStartedAt
-    const contents = isPdf
-      ? [{ role: 'user', parts: [{ text: prompt }, ...(pdfPages ?? [])] as GeminiPart[] }]
-      : [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: body.mimeType, data: body.data } }] as GeminiPart[] }]
-    const startedAt = Date.now()
-    let rateLimitedModelCount = 0
-    for (const model of GEMINI_MODELS) {
-      const remainingMs = totalTimeoutMs - (Date.now() - startedAt)
-      if (remainingMs <= 0) throw new Error('Gemini request timed out')
-
-      const controller = new AbortController()
-      const timeoutId = setTimeout(() => controller.abort(), Math.min(attemptTimeoutMs, remainingMs))
-      const attemptStartedAt = Date.now()
-      let attemptRecorded = false
-      const recordAttempt = (outcome: GeminiAttemptOutcome, httpStatus: number | null) => {
-        if (attemptRecorded) return
-        attemptRecorded = true
-        timings.geminiAttempts.push({ model, ms: Date.now() - attemptStartedAt, outcome, httpStatus })
-      }
-      try {
-        const { response, result } = await withTimeout((async () => {
-          const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              contents,
-              generationConfig: {
-                responseMimeType: 'application/json',
-                responseSchema: receiptSchema,
-                thinkingConfig: { thinkingLevel: 'minimal' },
-                temperature: 0,
-              },
-            }),
-            signal: controller.signal,
-          })
-          return { response, result: await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> } }
-        })(), Math.min(attemptTimeoutMs, remainingMs), 'Gemini request timed out')
-        recordAttempt(response.ok ? 'success' : 'fail', response.status)
-        if (response.status === 429 && !isPdf) rateLimitedModelCount += 1
-        if ((response.status === 429 && !isPdf) || response.status === 503 || response.status === 504) continue
-        if (!response.ok) return respond({ error: 'Gemini could not read this receipt.' }, 502)
-        const text = result.candidates?.[0]?.content?.parts?.find((part) => part.text)?.text
-        if (!text) return respond({ error: 'Gemini returned no receipt data.' }, 502)
-        const parseStartedAt = Date.now()
-        const receipt = normalizeReceiptAmounts(JSON.parse(text) as ReceiptResponse)
-        timings.parseMs = Date.now() - parseStartedAt
-        return respond(receipt)
-      } catch (error) {
-        const isTimeout = error instanceof Error && (error.name === 'AbortError' || error.message === 'Gemini request timed out')
-        recordAttempt(isTimeout ? 'timeout' : 'fail', null)
-        if (error instanceof Error && error.name === 'AbortError') continue
-        if (error instanceof Error && error.message === 'Gemini request timed out') continue
-        throw error
-      } finally {
-        clearTimeout(timeoutId)
-      }
-    }
-    if (!isPdf && rateLimitedModelCount === GEMINI_MODELS.length) return respond({ error: 'Gemini is temporarily busy. Please try again in a few seconds.' }, 429)
-    return respond({ error: 'Gemini could not read this receipt.' }, 502)
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') return respond({ error: 'Gemini receipt scanning timed out.' }, 504)
-    if (error instanceof Error && error.message.includes('timed out')) return respond({ error: error.message }, 504)
-    return respond({ error: 'Gemini receipt scanning failed.' }, 502)
+    return respond({ error: error instanceof Error && error.message.includes('timed out') ? error.message : 'The receipt upload could not be read.' }, 400)
   }
+
+  const { mimeType, data } = body
+  if (!mimeType || !data) return respond({ error: 'A receipt photo or PDF is required.' }, 400)
+  let fileBlock: Anthropic.ImageBlockParam | Anthropic.DocumentBlockParam
+  if (mimeType === 'application/pdf') fileBlock = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data } }
+  else if (isImageMediaType(mimeType)) fileBlock = { type: 'image', source: { type: 'base64', media_type: mimeType, data } }
+  else return respond({ error: `This file type (${mimeType}) can't be scanned. Use a JPEG, PNG, WebP, or PDF.` }, 415)
+
+  const client = new Anthropic({ apiKey, timeout: CLAUDE_TIMEOUT_MS, maxRetries: 0 })
+  const callStartedAt = Date.now()
+  const recordCall = (outcome: ClaudeCallOutcome, httpStatus: number | null, response?: Anthropic.Message) => {
+    timings.claude = {
+      model: CLAUDE_MODEL, ms: Date.now() - callStartedAt, outcome, httpStatus,
+      inputTokens: response?.usage.input_tokens ?? null, outputTokens: response?.usage.output_tokens ?? null, stopReason: response?.stop_reason ?? null,
+    }
+  }
+
+  let message: Anthropic.Message
+  try {
+    message = await client.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 400,
+      system: SYSTEM_PROMPT,
+      tools: [saveReceiptTool],
+      // Forced tool call: the response is the tool_use block only, with no text (or thinking) before it.
+      tool_choice: { type: 'tool', name: saveReceiptTool.name },
+      messages: [{ role: 'user', content: [fileBlock, { type: 'text', text: 'Record this receipt with save_receipt.' }] }],
+    })
+  } catch (error) {
+    if (error instanceof Anthropic.APIConnectionTimeoutError) {
+      recordCall('timeout', null)
+      return respond({ error: `Claude took longer than ${CLAUDE_TIMEOUT_MS / 1000} seconds to read this receipt. Please try again.` }, 504)
+    }
+    if (error instanceof Anthropic.AuthenticationError) {
+      recordCall('fail', error.status)
+      return respond({ error: 'ANTHROPIC_API_KEY was rejected by Anthropic (invalid or revoked key). Check the key in .env.local or the Vercel project settings.' }, 500)
+    }
+    if (error instanceof Anthropic.RateLimitError) {
+      recordCall('fail', error.status)
+      return respond({ error: 'Claude is rate-limited right now. Please try again in a few seconds.' }, 429)
+    }
+    if (error instanceof Anthropic.APIConnectionError) {
+      recordCall('fail', null)
+      return respond({ error: 'Could not reach the Claude API. Check the server\'s internet connection and try again.' }, 502)
+    }
+    if (error instanceof Anthropic.APIError) {
+      recordCall('fail', error.status ?? null)
+      return respond({ error: `Claude API error${error.status ? ` (HTTP ${error.status})` : ''}: ${error.message}` }, 502)
+    }
+    recordCall('fail', null)
+    return respond({ error: 'Receipt scanning failed unexpectedly.' }, 500)
+  }
+
+  recordCall('success', 200, message)
+  const rawToolInput = JSON.stringify(message.content.find((block) => block.type === 'tool_use')?.input ?? null)
+  console.log(`[receipt-diag] stop_reason=${message.stop_reason} blocks=${message.content.map((block) => block.type).join(',')} tool_input=${rawToolInput.slice(0, 1000)}`)
+  if (message.stop_reason === 'refusal') return respond({ error: 'Claude declined to read this file.' }, 502)
+  if (message.stop_reason === 'max_tokens') return respond({ error: 'Claude\'s answer was cut off (receipt too long). Please try again or enter it manually.' }, 502)
+  const toolUse = message.content.find((block): block is Anthropic.ToolUseBlock => block.type === 'tool_use' && block.name === saveReceiptTool.name)
+
+  const parseStartedAt = Date.now()
+  const extracted = toolUse ? parseExtractedReceipt(toolUse.input) : null
+  timings.parseMs = Date.now() - parseStartedAt
+  if (!extracted) return respond({ error: 'Claude returned receipt data in an unexpected format. Please try again.' }, 502)
+  return respond(normalizeReceiptAmounts(extracted))
 }
