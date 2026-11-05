@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { CameraIcon, CheckCircleIcon, DocumentArrowUpIcon, PencilSquareIcon, PhotoIcon, ReceiptPercentIcon } from '@heroicons/react/24/outline'
+import type { ReceiptTimings } from './receiptTimings'
 
 type ExpenseRecord = {
   id: string
@@ -73,23 +74,55 @@ const toGeminiImage = async (file: File) => {
   for (const byte of bytes) binary += String.fromCharCode(byte)
   return { mimeType: file.type || 'application/octet-stream', data: btoa(binary) }
 }
-const readReceiptWithGemini = async (file: File) => {
+// Temporary diagnostics: one timing line per scan. Upload ≈ round trip − server total.
+const DEBUG_TIMINGS = true
+type ReceiptApiResponse = (GeminiReceipt & { timings?: ReceiptTimings }) | { error?: string; timings?: ReceiptTimings }
+const formatTimingLine = (file: File, outcome: string, encodeMs: number | null, roundTripMs: number | null, server: ReceiptTimings | undefined) => {
+  const ms = (value: number | null) => value == null ? '—' : `${Math.round(value)} ms`
+  const mb = (bytes: number) => `${(bytes / 1_048_576).toFixed(2)} MB`
+  const parts = [`[receipt-timing] ${outcome}`, `file ${mb(file.size)} ${file.type || 'unknown'}`, `encode ${ms(encodeMs)}`, `round trip ${ms(roundTripMs)}`]
+  if (!server) return [...parts, 'server timings unavailable'].join(' | ')
+  parts.push(`≈upload ${ms(roundTripMs == null ? null : roundTripMs - server.serverTotalMs)}`, `server ${ms(server.serverTotalMs)}`, `body ${mb(server.bodyBytes)}`, `body read ${ms(server.bodyReadMs)}`)
+  if (server.pdfRenderMs != null) parts.push(`pdf render ${ms(server.pdfRenderMs)}`)
+  for (const attempt of server.geminiAttempts) parts.push(`${attempt.model} ${ms(attempt.ms)} ${attempt.outcome}${attempt.httpStatus == null ? '' : ` HTTP ${attempt.httpStatus}`}`)
+  if (server.parseMs != null) parts.push(`parse ${ms(server.parseMs)}`)
+  return parts.join(' | ')
+}
+const readReceiptWithGemini = async (file: File, onTimingLine: (line: string) => void) => {
   const timeoutMs = clientTimeoutFor(file)
-  const image = await withTimeout(toGeminiImage(file), timeoutMs, 'Preparing receipt image timed out')
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+  let outcome = 'failed'
+  let encodeMs: number | null = null
+  let requestStartedAt: number | null = null
+  let roundTripMs: number | null = null
+  let serverTimings: ReceiptTimings | undefined
   try {
-    return await withTimeout((async () => {
-      const response = await fetch('/api/receipt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(image), signal: controller.signal })
-      const body = await response.json().catch(() => null) as { error?: string } | GeminiReceipt | null
-      if (!response.ok) throw new Error(body && 'error' in body && body.error ? body.error : 'Gemini receipt scanning failed')
-      return body as GeminiReceipt
-    })(), timeoutMs, 'Gemini receipt scanning timed out')
-  } catch (error) {
-    if (controller.signal.aborted) throw new Error('Gemini receipt scanning timed out', { cause: error })
-    throw error
+    const encodeStartedAt = performance.now()
+    const image = await withTimeout(toGeminiImage(file), timeoutMs, 'Preparing receipt image timed out')
+    encodeMs = performance.now() - encodeStartedAt
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
+    requestStartedAt = performance.now()
+    try {
+      return await withTimeout((async () => {
+        const response = await fetch('/api/receipt', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(image), signal: controller.signal })
+        const body = await response.json().catch(() => null) as ReceiptApiResponse | null
+        roundTripMs = performance.now() - (requestStartedAt ?? 0)
+        serverTimings = body?.timings
+        if (!response.ok) throw new Error(body && 'error' in body && body.error ? body.error : 'Gemini receipt scanning failed')
+        outcome = 'ok'
+        return body as GeminiReceipt
+      })(), timeoutMs, 'Gemini receipt scanning timed out')
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error('Gemini receipt scanning timed out', { cause: error })
+      throw error
+    } finally {
+      clearTimeout(timeoutId)
+    }
   } finally {
-    clearTimeout(timeoutId)
+    if (roundTripMs == null && requestStartedAt != null) roundTripMs = performance.now() - requestStartedAt
+    const line = formatTimingLine(file, outcome, encodeMs, roundTripMs, serverTimings)
+    console.log(line)
+    onTimingLine(line)
   }
 }
 const normalizeCategory = (value: string | null) => CATEGORIES.find((category) => category.toLowerCase() === value?.toLowerCase()) ?? 'Other'
@@ -118,6 +151,8 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   const [processingMessage, setProcessingMessage] = useState('')
   const [receiptError, setReceiptError] = useState('')
   const [retryFile, setRetryFile] = useState<File | null>(null)
+  const [timingLine, setTimingLine] = useState('')
+  const timingNote = DEBUG_TIMINGS && timingLine ? <p className="mt-3 break-all font-mono text-[11px] leading-snug text-stone-400">{timingLine}</p> : null
 
   useEffect(() => {
     const fileInputs = document.querySelectorAll<HTMLInputElement>('input[type="file"]')
@@ -127,9 +162,9 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
 
   const selectReceipt = async (file: File) => {
     const timeoutMs = clientTimeoutFor(file)
-    setIsProcessing(true); setReceiptError(''); setRetryFile(file); setDraft(null); setProcessingMessage('Processing receipt...')
+    setIsProcessing(true); setReceiptError(''); setRetryFile(file); setDraft(null); setProcessingMessage('Processing receipt...'); setTimingLine('')
     try {
-      const [receipt, attachmentData] = await Promise.all([readReceiptWithGemini(file), withTimeout(readDataUrl(file), timeoutMs, 'Attaching receipt timed out')])
+      const [receipt, attachmentData] = await Promise.all([readReceiptWithGemini(file, setTimingLine), withTimeout(readDataUrl(file), timeoutMs, 'Attaching receipt timed out')])
       setDraft({ ...emptyDraft, ...geminiToDraft(receipt, file.type === 'application/pdf'), attachmentName: file.name, attachmentType: file.type || 'application/octet-stream', attachmentData })
       setProcessingMessage('Receipt information found. Review the fields before saving.')
     } catch (error) {
@@ -142,7 +177,7 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   const updateDraft = (field: keyof ExpenseDraft, value: string) => setDraft((current) => current ? { ...current, [field]: value } : current)
   const saveExpense = () => {
     if (!draft?.attachmentData) return
-    onExpensesChange([{ ...draft, id: crypto.randomUUID(), createdAt: new Date().toISOString() }, ...expenses]); setDraft(null); setRetryFile(null); setProcessingMessage('')
+    onExpensesChange([{ ...draft, id: crypto.randomUUID(), createdAt: new Date().toISOString() }, ...expenses]); setDraft(null); setRetryFile(null); setProcessingMessage(''); setTimingLine('')
   }
 
   if (selectedExpense) return (
@@ -163,10 +198,11 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
         <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200 sm:col-span-2"><span className="mb-2 block text-sm font-semibold">Description</span><textarea value={draft.description} onChange={(event) => updateDraft('description', event.target.value)} rows={3} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none" /></label>
       </div>
       <div className="mt-5 flex flex-wrap items-center gap-3"><button type="button" onClick={() => setDraft(null)} className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800">Cancel</button><button type="button" onClick={saveExpense} className="flex items-center gap-2 rounded-2xl bg-amber-900 px-4 py-3 text-sm font-semibold text-white"><CheckCircleIcon className="h-5 w-5" /> Save Expense</button><span className="text-xs text-stone-500">Attached: {draft.attachmentName}</span></div>
+      {timingNote}
     </section>
   )
 
-  return <section className="space-y-4"><div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6"><div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Business records</p><h2 className="text-2xl font-black text-stone-900">Expenses</h2><p className="mt-1 text-sm text-stone-500">Keep each receipt attached to its expense.</p></div><ReceiptPercentIcon className="h-7 w-7 text-amber-900" /></div><div className="grid gap-3 md:grid-cols-3"><label className="flex cursor-pointer flex-col items-center justify-center rounded-2xl bg-stone-50 p-5 text-center ring-1 ring-stone-200 transition hover:bg-amber-50"><CameraIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Take a Photo</span><input type="file" accept="image/*" capture="environment" className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label className="flex cursor-pointer flex-col items-center justify-center rounded-2xl bg-stone-50 p-5 text-center ring-1 ring-stone-200 transition hover:bg-amber-50"><PhotoIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Choose Photo</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label className="flex cursor-pointer flex-col items-center justify-center rounded-2xl bg-stone-50 p-5 text-center ring-1 ring-stone-200 transition hover:bg-amber-50"><DocumentArrowUpIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Upload Document</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label></div>{isProcessing && <p className="mt-4 text-sm text-stone-500">Processing receipt...</p>}{receiptError && <div className="mt-4 flex flex-wrap items-center gap-3 text-sm text-red-700"><p>{receiptError}</p>{retryFile && <button type="button" onClick={() => selectReceipt(retryFile)} className="rounded-xl bg-red-100 px-3 py-2 font-semibold text-red-800">Retry</button>}</div>}</div><div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6"><div className="mb-4 flex items-center justify-between"><p className="text-sm font-semibold text-stone-900">Saved expenses</p><span className="rounded-full bg-stone-100 px-3 py-1 text-xs font-bold text-stone-700">{expenses.length}</span></div>{expenses.length === 0 ? <p className="rounded-2xl bg-stone-50 p-5 text-sm text-stone-500">No expenses saved yet.</p> : <div className="grid gap-2">{expenses.map((expense) => <button key={expense.id} type="button" onClick={() => setSelectedExpense(expense)} className="grid gap-1 rounded-2xl bg-stone-50 p-4 text-left ring-1 ring-stone-200 transition hover:bg-amber-50 sm:grid-cols-[1fr,1fr,1fr,auto] sm:items-center"><span className="font-semibold text-stone-900">{dateLabel(expense.date)}</span><span className="text-sm text-stone-700">{expense.merchant || 'Unnamed merchant'}</span><span className="text-sm text-stone-600">{expense.category}</span><span className="font-bold text-amber-900">{formatAmount(expense.total)}</span></button>)}</div>}</div></section>
+  return <section className="space-y-4"><div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6"><div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Business records</p><h2 className="text-2xl font-black text-stone-900">Expenses</h2><p className="mt-1 text-sm text-stone-500">Keep each receipt attached to its expense.</p></div><ReceiptPercentIcon className="h-7 w-7 text-amber-900" /></div><div className="grid gap-3 md:grid-cols-3"><label className="flex cursor-pointer flex-col items-center justify-center rounded-2xl bg-stone-50 p-5 text-center ring-1 ring-stone-200 transition hover:bg-amber-50"><CameraIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Take a Photo</span><input type="file" accept="image/*" capture="environment" className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label className="flex cursor-pointer flex-col items-center justify-center rounded-2xl bg-stone-50 p-5 text-center ring-1 ring-stone-200 transition hover:bg-amber-50"><PhotoIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Choose Photo</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label className="flex cursor-pointer flex-col items-center justify-center rounded-2xl bg-stone-50 p-5 text-center ring-1 ring-stone-200 transition hover:bg-amber-50"><DocumentArrowUpIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Upload Document</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label></div>{isProcessing && <p className="mt-4 text-sm text-stone-500">Processing receipt...</p>}{receiptError && <div className="mt-4 flex flex-wrap items-center gap-3 text-sm text-red-700"><p>{receiptError}</p>{retryFile && <button type="button" onClick={() => selectReceipt(retryFile)} className="rounded-xl bg-red-100 px-3 py-2 font-semibold text-red-800">Retry</button>}</div>}{!isProcessing && timingNote}</div><div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6"><div className="mb-4 flex items-center justify-between"><p className="text-sm font-semibold text-stone-900">Saved expenses</p><span className="rounded-full bg-stone-100 px-3 py-1 text-xs font-bold text-stone-700">{expenses.length}</span></div>{expenses.length === 0 ? <p className="rounded-2xl bg-stone-50 p-5 text-sm text-stone-500">No expenses saved yet.</p> : <div className="grid gap-2">{expenses.map((expense) => <button key={expense.id} type="button" onClick={() => setSelectedExpense(expense)} className="grid gap-1 rounded-2xl bg-stone-50 p-4 text-left ring-1 ring-stone-200 transition hover:bg-amber-50 sm:grid-cols-[1fr,1fr,1fr,auto] sm:items-center"><span className="font-semibold text-stone-900">{dateLabel(expense.date)}</span><span className="text-sm text-stone-700">{expense.merchant || 'Unnamed merchant'}</span><span className="text-sm text-stone-600">{expense.category}</span><span className="font-bold text-amber-900">{formatAmount(expense.total)}</span></button>)}</div>}</div></section>
 }
 
 export type { ExpenseRecord }

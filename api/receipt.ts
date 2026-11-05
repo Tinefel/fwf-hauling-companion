@@ -1,5 +1,6 @@
 import { createCanvas } from '@napi-rs/canvas'
 import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs'
+import type { GeminiAttemptOutcome, ReceiptTimings } from '../src/receiptTimings.js'
 
 type GeminiPart = { inlineData: { mimeType: string; data: string } } | { text: string }
 
@@ -120,14 +121,27 @@ export async function POST(request: Request) {
   const apiKey = process.env.GEMINI_API_KEY?.trim()
   if (!apiKey) return jsonResponse({ error: 'Receipt service is not configured. Check GEMINI_API_KEY.' }, 503)
 
+  // Temporary diagnostics: every response below carries a `timings` object.
+  const requestStartedAt = Date.now()
+  const timings: Omit<ReceiptTimings, 'serverTotalMs'> = { bodyBytes: 0, bodyReadMs: 0, pdfRenderMs: null, geminiAttempts: [], parseMs: null }
+  const respond = (payload: object, status = 200) => {
+    const finished: ReceiptTimings = { ...timings, serverTotalMs: Date.now() - requestStartedAt }
+    console.log(`[receipt-timing] server ${JSON.stringify(finished)}`)
+    return jsonResponse({ ...payload, timings: finished }, status)
+  }
   try {
-    const body = await withTimeout(request.json() as Promise<{ mimeType?: string; data?: string }>, BODY_TIMEOUT_MS, 'Receipt request body timed out')
-    if ((!body.mimeType?.startsWith('image/') && body.mimeType !== 'application/pdf') || !body.data) return jsonResponse({ error: 'A JPEG, PNG, HEIC, or PDF file is required.' }, 400)
+    const rawBody = await withTimeout(request.arrayBuffer(), BODY_TIMEOUT_MS, 'Receipt request body timed out')
+    timings.bodyBytes = rawBody.byteLength
+    const body = JSON.parse(new TextDecoder().decode(rawBody)) as { mimeType?: string; data?: string }
+    timings.bodyReadMs = Date.now() - requestStartedAt
+    if ((!body.mimeType?.startsWith('image/') && body.mimeType !== 'application/pdf') || !body.data) return respond({ error: 'A JPEG, PNG, HEIC, or PDF file is required.' }, 400)
 
     const isPdf = body.mimeType === 'application/pdf'
     const totalTimeoutMs = isPdf ? PDF_GEMINI_TIMEOUT_MS : GEMINI_TIMEOUT_MS
     const attemptTimeoutMs = isPdf ? PDF_GEMINI_ATTEMPT_TIMEOUT_MS : GEMINI_ATTEMPT_TIMEOUT_MS
+    const pdfStartedAt = Date.now()
     const pdfPages = isPdf ? await renderPdfPages(body.data) : null
+    if (isPdf) timings.pdfRenderMs = Date.now() - pdfStartedAt
     const contents = isPdf
       ? [{ role: 'user', parts: [{ text: prompt }, ...(pdfPages ?? [])] as GeminiPart[] }]
       : [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: body.mimeType, data: body.data } }] as GeminiPart[] }]
@@ -139,6 +153,13 @@ export async function POST(request: Request) {
 
       const controller = new AbortController()
       const timeoutId = setTimeout(() => controller.abort(), Math.min(attemptTimeoutMs, remainingMs))
+      const attemptStartedAt = Date.now()
+      let attemptRecorded = false
+      const recordAttempt = (outcome: GeminiAttemptOutcome, httpStatus: number | null) => {
+        if (attemptRecorded) return
+        attemptRecorded = true
+        timings.geminiAttempts.push({ model, ms: Date.now() - attemptStartedAt, outcome, httpStatus })
+      }
       try {
         const { response, result } = await withTimeout((async () => {
           const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`, {
@@ -157,14 +178,19 @@ export async function POST(request: Request) {
           })
           return { response, result: await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> } }
         })(), Math.min(attemptTimeoutMs, remainingMs), 'Gemini request timed out')
+        recordAttempt(response.ok ? 'success' : 'fail', response.status)
         if (response.status === 429 && !isPdf) rateLimitedModelCount += 1
         if ((response.status === 429 && !isPdf) || response.status === 503 || response.status === 504) continue
-        if (!response.ok) return jsonResponse({ error: 'Gemini could not read this receipt.' }, 502)
+        if (!response.ok) return respond({ error: 'Gemini could not read this receipt.' }, 502)
         const text = result.candidates?.[0]?.content?.parts?.find((part) => part.text)?.text
-        if (!text) return jsonResponse({ error: 'Gemini returned no receipt data.' }, 502)
+        if (!text) return respond({ error: 'Gemini returned no receipt data.' }, 502)
+        const parseStartedAt = Date.now()
         const receipt = normalizeReceiptAmounts(JSON.parse(text) as ReceiptResponse)
-        return jsonResponse(receipt)
+        timings.parseMs = Date.now() - parseStartedAt
+        return respond(receipt)
       } catch (error) {
+        const isTimeout = error instanceof Error && (error.name === 'AbortError' || error.message === 'Gemini request timed out')
+        recordAttempt(isTimeout ? 'timeout' : 'fail', null)
         if (error instanceof Error && error.name === 'AbortError') continue
         if (error instanceof Error && error.message === 'Gemini request timed out') continue
         throw error
@@ -172,11 +198,11 @@ export async function POST(request: Request) {
         clearTimeout(timeoutId)
       }
     }
-    if (!isPdf && rateLimitedModelCount === GEMINI_MODELS.length) return jsonResponse({ error: 'Gemini is temporarily busy. Please try again in a few seconds.' }, 429)
-    return jsonResponse({ error: 'Gemini could not read this receipt.' }, 502)
+    if (!isPdf && rateLimitedModelCount === GEMINI_MODELS.length) return respond({ error: 'Gemini is temporarily busy. Please try again in a few seconds.' }, 429)
+    return respond({ error: 'Gemini could not read this receipt.' }, 502)
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') return jsonResponse({ error: 'Gemini receipt scanning timed out.' }, 504)
-    if (error instanceof Error && error.message.includes('timed out')) return jsonResponse({ error: error.message }, 504)
-    return jsonResponse({ error: 'Gemini receipt scanning failed.' }, 502)
+    if (error instanceof Error && error.name === 'AbortError') return respond({ error: 'Gemini receipt scanning timed out.' }, 504)
+    if (error instanceof Error && error.message.includes('timed out')) return respond({ error: error.message }, 504)
+    return respond({ error: 'Gemini receipt scanning failed.' }, 502)
   }
 }
