@@ -2,7 +2,7 @@
 // Lives in src/ (not api/) because Vercel turns every file in api/ into an endpoint.
 // Types only: the API imports this with `import type`, which is erased at runtime.
 
-export type ReceiptCategory = 'Fuel / Gas' | 'Maintenance & Repairs' | 'Tires' | 'Parts' | 'Vehicle / Truck' | 'Insurance' | 'Registration / Licensing' | 'Tolls' | 'Office' | 'Phone / Communications' | 'Supplies' | 'Meals' | 'Professional Services' | 'Advertising / Marketing' | 'Trailer' | 'Equipment' | 'Miscellaneous'
+export type ReceiptCategory = 'Fuel / Gas' | 'Maintenance & Repairs' | 'Parts' | 'Vehicle / Truck' | 'Insurance / Licensing & Registration' | 'Meals' | 'Advertising / Marketing' | 'Miscellaneous'
 
 export type ReceiptPaymentMethod = 'Credit card' | 'Debit' | 'Cash' | 'Cheque' | 'E-transfer' | 'On account' | 'Other'
 

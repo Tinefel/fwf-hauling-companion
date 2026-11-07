@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
-import { CameraIcon, CheckCircleIcon, DocumentArrowUpIcon, DocumentTextIcon, PencilSquareIcon, PhotoIcon, ReceiptPercentIcon, TruckIcon } from '@heroicons/react/24/outline'
+import { useEffect, useRef, useState } from 'react'
+import { CameraIcon, CheckCircleIcon, DocumentArrowUpIcon, DocumentTextIcon, EllipsisHorizontalIcon, PencilSquareIcon, PhotoIcon, ReceiptPercentIcon, TrashIcon, TruckIcon } from '@heroicons/react/24/outline'
 import type { ExtractedReceipt, ReceiptApiResponse, ReceiptTimings } from './receiptTypes'
 
 type ExpenseRecord = {
@@ -29,7 +29,27 @@ type ExpenseTrackerProps = {
 
 type ExpenseDraft = Omit<ExpenseRecord, 'id' | 'createdAt'>
 
-const CATEGORIES = ['Fuel / Gas', 'Maintenance & Repairs', 'Tires', 'Parts', 'Vehicle / Truck', 'Insurance', 'Registration / Licensing', 'Tolls', 'Office', 'Phone / Communications', 'Supplies', 'Meals', 'Professional Services', 'Advertising / Marketing', 'Trailer', 'Equipment', 'Miscellaneous']
+const CATEGORIES = ['Fuel / Gas', 'Maintenance & Repairs', 'Parts', 'Vehicle / Truck', 'Insurance / Licensing & Registration', 'Meals', 'Advertising / Marketing', 'Miscellaneous']
+const canonicalCategory = (value: string | null) => {
+  switch (value) {
+    case 'Insurance':
+    case 'Registration / Licensing':
+      return 'Insurance / Licensing & Registration'
+    case 'Tires':
+    case 'Supplies':
+    case 'Equipment':
+      return 'Parts'
+    case 'Trailer':
+      return 'Maintenance & Repairs'
+    case 'Office':
+    case 'Phone / Communications':
+    case 'Tolls':
+    case 'Professional Services':
+      return 'Miscellaneous'
+    default:
+      return CATEGORIES.includes(value ?? '') ? value! : 'Miscellaneous'
+  }
+}
 const emptyDraft: ExpenseDraft = {
   merchant: '', date: '', category: 'Other', subtotal: '', gst: '', pst: '', total: '', invoiceNumber: '', description: '', paymentMethod: '', currency: 'CAD', lineItems: '', attachmentName: '', attachmentType: '', attachmentData: '',
 }
@@ -223,7 +243,7 @@ function ScanStatus({ scan }: { scan: ScanState }) {
     </div>
   )
 }
-const normalizeCategory = (value: string | null) => CATEGORIES.find((category) => category.toLowerCase() === value?.toLowerCase()) ?? 'Other'
+const normalizeCategory = (value: string | null) => canonicalCategory(value)
 const normalizeDate = (value: string | null) => {
   if (!value) return ''
   const date = new Date(value)
@@ -239,6 +259,12 @@ const receiptToDraft = (receipt: ExtractedReceipt, isPdf: boolean): Partial<Expe
 })
 const formatAmount = (value: string) => value && Number.isFinite(Number(value)) ? new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(Number(value)) : '—'
 const dateLabel = (value: string) => value ? new Date(`${value}T00:00:00`).toLocaleDateString('en-CA', { dateStyle: 'medium' }) : '—'
+const monthLabel = (value: string) => value === 'Unknown date' ? value : new Date(`${value}-01T00:00:00`).toLocaleDateString('en-CA', { month: 'long', year: 'numeric' })
+const expenseTotal = (expense: ExpenseRecord) => Number.isFinite(Number(expense.total)) ? Number(expense.total) : 0
+const sortedByExpenseDate = (items: ExpenseRecord[]) => [...items].sort((a, b) => {
+  const dateDifference = b.date.localeCompare(a.date)
+  return dateDifference || b.createdAt.localeCompare(a.createdAt)
+})
 
 function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   const [draft, setDraft] = useState<ExpenseDraft | null>(null)
@@ -248,12 +274,35 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   const [processingMessage, setProcessingMessage] = useState('')
   const [receiptError, setReceiptError] = useState('')
   const [retryFile, setRetryFile] = useState<File | null>(null)
+  const [merchantSearch, setMerchantSearch] = useState('')
+  const [categoryFilter, setCategoryFilter] = useState('All categories')
+  const [startDate, setStartDate] = useState('')
+  const [endDate, setEndDate] = useState('')
+  const [monthFilter, setMonthFilter] = useState('')
+  const [yearFilter, setYearFilter] = useState('')
+  const [expandedCategories, setExpandedCategories] = useState<Set<string>>(() => new Set())
+  const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null)
+  const [editingDraft, setEditingDraft] = useState<ExpenseDraft | null>(null)
+  const [deleteExpenseId, setDeleteExpenseId] = useState<string | null>(null)
+  const [expenseMenuId, setExpenseMenuId] = useState<string | null>(null)
+  const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const longPressActivated = useRef(false)
 
   useEffect(() => {
     const fileInputs = document.querySelectorAll<HTMLInputElement>('input[type="file"]')
     const documentInput = fileInputs[2]
     if (documentInput) documentInput.accept = 'application/pdf,.pdf,image/jpeg,image/png,image/heic,image/heif,.heic,.heif'
   }, [])
+
+  useEffect(() => {
+    const migrated = expenses.map((expense) => {
+      const category = canonicalCategory(expense.category)
+      return expense.category === category ? expense : { ...expense, category }
+    })
+    if (migrated.some((expense, index) => expense.category !== expenses[index].category)) {
+      onExpensesChange(migrated)
+    }
+  }, [expenses, onExpensesChange])
 
   const selectReceipt = async (file: File) => {
     if (isScanning) return
@@ -283,12 +332,113 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
     if (!draft?.attachmentData) return
     onExpensesChange([{ ...draft, id: crypto.randomUUID(), createdAt: new Date().toISOString() }, ...expenses]); setDraft(null); setRetryFile(null); setProcessingMessage('')
   }
+  const startEdit = (expense: ExpenseRecord) => {
+    setSelectedExpense(null)
+    setExpenseMenuId(null)
+    setEditingExpenseId(expense.id)
+    setEditingDraft({
+      merchant: expense.merchant,
+      date: expense.date,
+      category: canonicalCategory(expense.category),
+      subtotal: expense.subtotal,
+      gst: expense.gst,
+      pst: expense.pst,
+      total: expense.total,
+      invoiceNumber: expense.invoiceNumber,
+      description: expense.description,
+      paymentMethod: expense.paymentMethod,
+      currency: expense.currency,
+      lineItems: expense.lineItems,
+      attachmentName: expense.attachmentName,
+      attachmentType: expense.attachmentType,
+      attachmentData: expense.attachmentData,
+    })
+  }
+  const updateEditingDraft = (field: keyof ExpenseDraft, value: string) => setEditingDraft((current) => current ? { ...current, [field]: value } : current)
+  const replaceEditingAttachment = async (file: File) => {
+    try {
+      const attachmentData = await withTimeout(readDataUrl(file), CLIENT_TIMEOUT_MS, 'Attaching receipt timed out')
+      setEditingDraft((current) => current ? { ...current, attachmentName: file.name, attachmentType: file.type || 'application/octet-stream', attachmentData } : current)
+    } catch (error) {
+      setReceiptError(error instanceof Error ? error.message : 'Could not replace the receipt attachment.')
+    }
+  }
+  const saveEditedExpense = () => {
+    if (!editingExpenseId || !editingDraft) return
+    onExpensesChange(expenses.map((expense) => expense.id === editingExpenseId ? { ...editingDraft, id: expense.id, createdAt: expense.createdAt } : expense))
+    setEditingExpenseId(null)
+    setEditingDraft(null)
+  }
+  const cancelEdit = () => {
+    setEditingExpenseId(null)
+    setEditingDraft(null)
+  }
+  const confirmDelete = () => {
+    if (!deleteExpenseId) return
+    onExpensesChange(expenses.filter((expense) => expense.id !== deleteExpenseId))
+    setDeleteExpenseId(null)
+    setExpenseMenuId(null)
+  }
+  const clearFilters = () => {
+    setMerchantSearch('')
+    setCategoryFilter('All categories')
+    setStartDate('')
+    setEndDate('')
+    setMonthFilter('')
+    setYearFilter('')
+  }
+  const normalizedSearch = merchantSearch.trim().toLowerCase()
+  const filteredExpenses = sortedByExpenseDate(expenses.filter((expense) => {
+    if (normalizedSearch && !expense.merchant.toLowerCase().includes(normalizedSearch)) return false
+    if (categoryFilter !== 'All categories' && canonicalCategory(expense.category) !== categoryFilter) return false
+    if (startDate && expense.date < startDate) return false
+    if (endDate && expense.date > endDate) return false
+    if (monthFilter && expense.date.slice(0, 7) !== monthFilter) return false
+    if (yearFilter && expense.date.slice(0, 4) !== yearFilter) return false
+    return true
+  }))
+  const filteredTotal = filteredExpenses.reduce((sum, expense) => sum + expenseTotal(expense), 0)
+  const categoryGroups = CATEGORIES.map((category) => {
+    const items = filteredExpenses.filter((expense) => canonicalCategory(expense.category) === category)
+    return { category, items, total: items.reduce((sum, expense) => sum + expenseTotal(expense), 0) }
+  }).filter((group) => group.items.length > 0)
+  const monthlyTotals = [...filteredExpenses.reduce((totals, expense) => {
+    const month = expense.date.slice(0, 7) || 'Unknown date'
+    totals.set(month, (totals.get(month) ?? 0) + expenseTotal(expense))
+    return totals
+  }, new Map<string, number>())]
+    .sort(([a], [b]) => b.localeCompare(a))
+  const yearlyTotals = [...filteredExpenses.reduce((totals, expense) => {
+    const year = expense.date.slice(0, 4) || 'Unknown date'
+    totals.set(year, (totals.get(year) ?? 0) + expenseTotal(expense))
+    return totals
+  }, new Map<string, number>())]
+    .sort(([a], [b]) => b.localeCompare(a))
+  const toggleCategory = (category: string) => setExpandedCategories((current) => {
+    const next = new Set(current)
+    if (next.has(category)) next.delete(category)
+    else next.add(category)
+    return next
+  })
+
+  if (editingExpenseId && editingDraft) return (
+    <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
+      <div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Saved expense</p><h2 className="text-2xl font-black text-stone-900">Edit Expense</h2></div><PencilSquareIcon className="h-5 w-5 text-amber-900" /></div>
+      <div className="grid gap-3 sm:grid-cols-2">{[['merchant', 'Merchant / Supplier'], ['date', 'Expense date'], ['subtotal', 'Subtotal'], ['gst', 'GST'], ['pst', 'PST'], ['total', 'Total']].map(([field, label]) => <label key={field} className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">{label}</span><input type={field === 'date' ? 'date' : field === 'merchant' ? 'text' : 'number'} step={field === 'merchant' ? undefined : '0.01'} value={editingDraft[field as keyof ExpenseDraft]} onChange={(event) => updateEditingDraft(field as keyof ExpenseDraft, event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none focus:border-amber-700" /></label>)}
+        <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Expense category</span><select value={editingDraft.category} onChange={(event) => updateEditingDraft('category', event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none">{CATEGORIES.map((category) => <option key={category}>{category}</option>)}</select></label>
+        <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200 sm:col-span-2"><span className="mb-2 block text-sm font-semibold">Description / Notes</span><textarea value={editingDraft.description} onChange={(event) => updateEditingDraft('description', event.target.value)} rows={3} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none" /></label>
+        <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200 sm:col-span-2"><span className="mb-2 block text-sm font-semibold">Receipt photo or document</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif,application/pdf,.pdf" onChange={(event) => event.target.files?.[0] && void replaceEditingAttachment(event.target.files[0])} className="block w-full text-sm text-stone-700" /><span className="mt-2 block text-xs text-stone-500">Attached: {editingDraft.attachmentName || 'None'}</span></label>
+      </div>
+      {editingDraft.attachmentData && <div className="mt-4 overflow-hidden rounded-2xl bg-stone-100 ring-1 ring-stone-200">{editingDraft.attachmentType === 'application/pdf' ? <iframe title={editingDraft.attachmentName} src={editingDraft.attachmentData} className="h-[min(70vh,720px)] w-full" /> : <img src={editingDraft.attachmentData} alt={editingDraft.attachmentName} className="max-h-[720px] w-full object-contain" />}</div>}
+      <div className="mt-5 flex flex-wrap items-center gap-3"><button type="button" onClick={cancelEdit} className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800">Cancel</button><button type="button" onClick={saveEditedExpense} className="flex items-center gap-2 rounded-2xl bg-amber-900 px-4 py-3 text-sm font-semibold text-white"><CheckCircleIcon className="h-5 w-5" />Save Changes</button></div>
+    </section>
+  )
 
   if (selectedExpense) return (
     <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
       <button type="button" onClick={() => setSelectedExpense(null)} className="mb-5 text-sm font-semibold text-amber-900">Back to Expenses</button>
       <h2 className="mb-5 text-2xl font-black text-stone-900">{selectedExpense.merchant || 'Unnamed merchant'}</h2>
-      <div className="grid gap-3 sm:grid-cols-2">{[['Date', dateLabel(selectedExpense.date)], ['Category', selectedExpense.category], ['Subtotal', formatAmount(selectedExpense.subtotal)], ['GST', formatAmount(selectedExpense.gst)], ['PST', formatAmount(selectedExpense.pst)], ['Total', formatAmount(selectedExpense.total)], ['Payment method', selectedExpense.paymentMethod || '—'], ['Currency', selectedExpense.currency || '—'], ['Receipt number', selectedExpense.invoiceNumber || '—'], ['Description', selectedExpense.description || '—'], ['Line items', selectedExpense.lineItems || '—']].map(([label, value]) => <div key={label} className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><p className="text-xs font-semibold text-stone-500">{label}</p><p className="mt-1 whitespace-pre-wrap text-sm font-semibold text-stone-900">{value}</p></div>)}</div>
+      <div className="grid gap-3 sm:grid-cols-2">{[['Date', dateLabel(selectedExpense.date)], ['Category', canonicalCategory(selectedExpense.category)], ['Subtotal', formatAmount(selectedExpense.subtotal)], ['GST', formatAmount(selectedExpense.gst)], ['PST', formatAmount(selectedExpense.pst)], ['Total', formatAmount(selectedExpense.total)], ['Payment method', selectedExpense.paymentMethod || '—'], ['Currency', selectedExpense.currency || '—'], ['Receipt number', selectedExpense.invoiceNumber || '—'], ['Description', selectedExpense.description || '—'], ['Line items', selectedExpense.lineItems || '—']].map(([label, value]) => <div key={label} className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><p className="text-xs font-semibold text-stone-500">{label}</p><p className="mt-1 whitespace-pre-wrap text-sm font-semibold text-stone-900">{value}</p></div>)}</div>
       <div className="mt-5 overflow-hidden rounded-2xl bg-stone-100 ring-1 ring-stone-200">{selectedExpense.attachmentType === 'application/pdf' ? <iframe title={selectedExpense.attachmentName} src={selectedExpense.attachmentData} className="h-[min(70vh,720px)] w-full" /> : <img src={selectedExpense.attachmentData} alt={selectedExpense.attachmentName} className="max-h-[720px] w-full object-contain" />}</div>
       <p className="mt-2 text-xs text-stone-500">Attached: {selectedExpense.attachmentName}</p>
     </section>
@@ -305,7 +455,62 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
     </section>
   )
 
-  return <section className="space-y-4"><div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6"><div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Business records</p><h2 className="text-2xl font-black text-stone-900">Expenses</h2><p className="mt-1 text-sm text-stone-500">Keep each receipt attached to its expense.</p></div><ReceiptPercentIcon className="h-7 w-7 text-amber-900" /></div><div className="grid gap-3 md:grid-cols-3"><label aria-disabled={isScanning} className={captureButtonClass}><CameraIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Take a Photo</span><input type="file" accept="image/*" capture="environment" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label aria-disabled={isScanning} className={captureButtonClass}><PhotoIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Choose Photo</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label aria-disabled={isScanning} className={captureButtonClass}><DocumentArrowUpIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Upload Document</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label></div>{scan && <ScanStatus key={scan.previewUrl ?? scan.fileName} scan={scan} />}{receiptError && <div role="alert" className="mt-4 flex flex-wrap items-center gap-3 text-sm text-red-700"><p>{receiptError}</p>{retryFile && <button type="button" onClick={() => selectReceipt(retryFile)} className="rounded-xl bg-red-100 px-3 py-2 font-semibold text-red-800">Retry</button>}</div>}</div><div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6"><div className="mb-4 flex items-center justify-between"><p className="text-sm font-semibold text-stone-900">Saved expenses</p><span className="rounded-full bg-stone-100 px-3 py-1 text-xs font-bold text-stone-700">{expenses.length}</span></div>{expenses.length === 0 ? <p className="rounded-2xl bg-stone-50 p-5 text-sm text-stone-500">No expenses saved yet.</p> : <div className="grid gap-2">{expenses.map((expense) => <button key={expense.id} type="button" onClick={() => setSelectedExpense(expense)} className="grid gap-1 rounded-2xl bg-stone-50 p-4 text-left ring-1 ring-stone-200 transition hover:bg-amber-50 sm:grid-cols-[1fr,1fr,1fr,auto] sm:items-center"><span className="font-semibold text-stone-900">{dateLabel(expense.date)}</span><span className="text-sm text-stone-700">{expense.merchant || 'Unnamed merchant'}</span><span className="text-sm text-stone-600">{expense.category}</span><span className="font-bold text-amber-900">{formatAmount(expense.total)}</span></button>)}</div>}</div></section>
+  const years = [...new Set(expenses.map((expense) => expense.date.slice(0, 4)).filter(Boolean))].sort().reverse()
+
+  return (
+    <>
+      <section className="space-y-4">
+      <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
+        <div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Business records</p><h2 className="text-2xl font-black text-stone-900">Expenses</h2><p className="mt-1 text-sm text-stone-500">Keep each receipt attached to its expense.</p></div><ReceiptPercentIcon className="h-7 w-7 text-amber-900" /></div>
+        <div className="grid gap-3 md:grid-cols-3"><label aria-disabled={isScanning} className={captureButtonClass}><CameraIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Take a Photo</span><input type="file" accept="image/*" capture="environment" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label aria-disabled={isScanning} className={captureButtonClass}><PhotoIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Choose Photo</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label aria-disabled={isScanning} className={captureButtonClass}><DocumentArrowUpIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Upload Document</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label></div>
+        {scan && <ScanStatus key={scan.previewUrl ?? scan.fileName} scan={scan} />}
+        {receiptError && <div role="alert" className="mt-4 flex flex-wrap items-center gap-3 text-sm text-red-700"><p>{receiptError}</p>{retryFile && <button type="button" onClick={() => selectReceipt(retryFile)} className="rounded-xl bg-red-100 px-3 py-2 font-semibold text-red-800">Retry</button>}</div>}
+      </div>
+
+      <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
+        <div className="mb-4 flex items-center justify-between"><p className="text-sm font-semibold text-stone-900">Expense overview</p><span className="rounded-full bg-stone-100 px-3 py-1 text-xs font-bold text-stone-700">{filteredExpenses.length} of {expenses.length}</span></div>
+        <div className="mb-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Search merchant</span><input type="search" value={merchantSearch} onChange={(event) => setMerchantSearch(event.target.value)} placeholder="e.g. PBX Truck Service" className="w-full rounded-xl border border-stone-300 bg-white px-3 py-2 text-sm outline-none" /></label>
+          <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Category</span><select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)} className="w-full rounded-xl border border-stone-300 bg-white px-3 py-2 text-sm outline-none"><option>All categories</option>{CATEGORIES.map((category) => <option key={category}>{category}</option>)}</select></label>
+          <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Start date</span><input type="date" value={startDate} onChange={(event) => setStartDate(event.target.value)} className="w-full rounded-xl border border-stone-300 bg-white px-3 py-2 text-sm outline-none" /></label>
+          <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">End date</span><input type="date" value={endDate} onChange={(event) => setEndDate(event.target.value)} className="w-full rounded-xl border border-stone-300 bg-white px-3 py-2 text-sm outline-none" /></label>
+          <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Month</span><input type="month" value={monthFilter} onChange={(event) => setMonthFilter(event.target.value)} className="w-full rounded-xl border border-stone-300 bg-white px-3 py-2 text-sm outline-none" /></label>
+          <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Year</span><select value={yearFilter} onChange={(event) => setYearFilter(event.target.value)} className="w-full rounded-xl border border-stone-300 bg-white px-3 py-2 text-sm outline-none"><option value="">All years</option>{years.map((year) => <option key={year}>{year}</option>)}</select></label>
+          <button type="button" onClick={clearFilters} className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800 sm:self-end">Clear all filters</button>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="rounded-2xl bg-amber-50 p-4 ring-1 ring-amber-200"><p className="text-xs font-semibold uppercase tracking-wide text-amber-900">Selected period total</p><p className="mt-1 text-xl font-black text-amber-950">{formatAmount(filteredTotal.toFixed(2))}</p></div>
+          <div className="rounded-2xl bg-stone-50 p-4 ring-1 ring-stone-200"><p className="text-xs font-semibold uppercase tracking-wide text-stone-500">Categories</p><p className="mt-1 text-xl font-black text-stone-900">{categoryGroups.length}</p></div>
+          <div className="rounded-2xl bg-stone-50 p-4 ring-1 ring-stone-200"><p className="text-xs font-semibold uppercase tracking-wide text-stone-500">Monthly totals</p><p className="mt-1 text-xl font-black text-stone-900">{monthlyTotals.length}</p></div>
+          <div className="rounded-2xl bg-stone-50 p-4 ring-1 ring-stone-200"><p className="text-xs font-semibold uppercase tracking-wide text-stone-500">Yearly totals</p><p className="mt-1 text-xl font-black text-stone-900">{yearlyTotals.length}</p></div>
+        </div>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(260px,1fr)]">
+        <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
+          <div className="mb-4 flex items-center justify-between"><p className="text-sm font-semibold text-stone-900">Expenses by category</p><span className="text-xs text-stone-500">Newest first</span></div>
+          {categoryGroups.length === 0 ? <p className="rounded-2xl bg-stone-50 p-5 text-sm text-stone-500">No expenses match the selected filters.</p> : <div className="space-y-3">{categoryGroups.map(({ category, items, total }) => {
+            const isExpanded = !expandedCategories.has(category)
+            return <div key={category} className="overflow-hidden rounded-2xl ring-1 ring-stone-200"><button type="button" onClick={() => toggleCategory(category)} aria-expanded={isExpanded} className="flex w-full items-center justify-between gap-3 bg-stone-50 p-4 text-left"><span><span className="block font-semibold text-stone-900">{category}</span><span className="mt-1 block text-xs text-stone-500">{items.length} expense{items.length === 1 ? '' : 's'}</span></span><span className="flex items-center gap-3"><span className="font-bold text-amber-900">{formatAmount(total.toFixed(2))}</span><span className="text-stone-500">{isExpanded ? '−' : '+'}</span></span></button>{isExpanded && <div className="grid gap-2 p-3">{items.map((expense) => <div key={expense.id} className="relative flex rounded-xl bg-white ring-1 ring-stone-200"><button type="button" onTouchStart={() => { longPressActivated.current = false; if (longPressTimer.current) clearTimeout(longPressTimer.current); longPressTimer.current = setTimeout(() => { longPressActivated.current = true; setExpenseMenuId(expense.id) }, 650) }} onTouchEnd={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current) }} onTouchCancel={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current) }} onContextMenu={(event) => { event.preventDefault(); setExpenseMenuId(expense.id) }} onClick={() => { if (longPressActivated.current) { longPressActivated.current = false; return } startEdit(expense) }} className="grid min-w-0 flex-1 gap-1 p-4 text-left transition hover:bg-amber-50 sm:grid-cols-[1fr,1fr,auto] sm:items-center"><span className="font-semibold text-stone-900">{dateLabel(expense.date)}</span><span className="text-sm text-stone-700">{expense.merchant || 'Unnamed merchant'}</span><span className="font-bold text-amber-900">{formatAmount(expense.total)}</span></button><button type="button" aria-label={`Expense options for ${expense.merchant || 'Unnamed merchant'}`} onClick={() => setExpenseMenuId((current) => current === expense.id ? null : expense.id)} className="flex w-12 shrink-0 items-center justify-center rounded-r-xl text-stone-600 hover:bg-stone-100"><EllipsisHorizontalIcon className="h-6 w-6" /></button>{expenseMenuId === expense.id && <div className="absolute right-3 top-12 z-20 w-36 rounded-xl bg-white p-1 shadow-lg ring-1 ring-stone-200"><button type="button" onClick={() => startEdit(expense)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-stone-800 hover:bg-stone-100"><PencilSquareIcon className="h-4 w-4" />Edit</button><button type="button" onClick={() => { setExpenseMenuId(null); setDeleteExpenseId(expense.id) }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-red-700 hover:bg-red-50"><TrashIcon className="h-4 w-4" />Delete</button></div>}</div>)}</div>}</div>
+          })}</div>}
+        </div>
+        <div className="space-y-4">
+          <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200"><p className="mb-3 text-sm font-semibold text-stone-900">Monthly spending</p>{monthlyTotals.length === 0 ? <p className="text-sm text-stone-500">No monthly totals.</p> : <div className="space-y-2">{monthlyTotals.map(([month, total]) => <div key={month} className="flex items-center justify-between rounded-xl bg-stone-50 px-3 py-2"><span className="text-sm text-stone-700">{monthLabel(month)}</span><span className="font-bold text-amber-900">{formatAmount(total.toFixed(2))}</span></div>)}</div>}</div>
+          <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200"><p className="mb-3 text-sm font-semibold text-stone-900">Yearly spending</p>{yearlyTotals.length === 0 ? <p className="text-sm text-stone-500">No yearly totals.</p> : <div className="space-y-2">{yearlyTotals.map(([year, total]) => <div key={year} className="flex items-center justify-between rounded-xl bg-stone-50 px-3 py-2"><span className="text-sm text-stone-700">{year}</span><span className="font-bold text-amber-900">{formatAmount(total.toFixed(2))}</span></div>)}</div>}</div>
+        </div>
+      </div>
+      </section>
+      {deleteExpenseId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/40 p-4" role="dialog" aria-modal="true" aria-label="Delete expense confirmation">
+          <div className="w-full max-w-sm rounded-[24px] bg-white p-5 shadow-xl ring-1 ring-stone-200">
+            <h2 className="text-lg font-black text-stone-900">Delete expense?</h2>
+            <p className="mt-2 text-sm text-stone-600">Are you sure you want to permanently delete this expense?</p>
+            <div className="mt-5 flex justify-end gap-3"><button type="button" onClick={() => setDeleteExpenseId(null)} className="rounded-xl bg-stone-200 px-4 py-2 text-sm font-semibold text-stone-800">Cancel</button><button type="button" onClick={confirmDelete} className="rounded-xl bg-red-700 px-4 py-2 text-sm font-semibold text-white">Delete</button></div>
+          </div>
+        </div>
+      )}
+    </>
+  )
 }
 
 export type { ExpenseRecord }

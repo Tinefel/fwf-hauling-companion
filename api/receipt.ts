@@ -3,9 +3,8 @@ import type { ClaudeCallOutcome, ExtractedReceipt, ReceiptCategory, ReceiptPayme
 
 // Claude picks a short code; we map it back to the label the form shows.
 const CATEGORY_CODES = {
-  fuel: 'Fuel / Gas', repairs: 'Maintenance & Repairs', tires: 'Tires', parts: 'Parts', vehicle: 'Vehicle / Truck', insurance: 'Insurance',
-  licensing: 'Registration / Licensing', tolls: 'Tolls', office: 'Office', phone: 'Phone / Communications', supplies: 'Supplies', meals: 'Meals',
-  professional: 'Professional Services', advertising: 'Advertising / Marketing', trailer: 'Trailer', equipment: 'Equipment', other: 'Miscellaneous',
+  fuel: 'Fuel / Gas', repairs: 'Maintenance & Repairs', parts: 'Parts', vehicle: 'Vehicle / Truck',
+  insurance: 'Insurance / Licensing & Registration', meals: 'Meals', advertising: 'Advertising / Marketing', other: 'Miscellaneous',
 } as const satisfies Record<string, ReceiptCategory>
 type CategoryCode = keyof typeof CATEGORY_CODES
 // Fails to compile if any ReceiptCategory has no code (the missing label becomes a required key).
@@ -77,7 +76,7 @@ const SYSTEM_PROMPT = `Extract Canadian receipts and invoices with save_receipt.
 - Fuel receipts list litres and price per litre; those are not totals.
 - Numeric dates are month/day/year.
 - paymentMethod: on_account for charge / net-terms invoices.
-- category: repairs for shop labour or repair work (including on trailers).`
+- category: repairs for shop labour or repair work.`
 
 // Runtime check of Claude's tool input against ExtractedReceipt (strict mode should guarantee it; this keeps the type honest).
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)

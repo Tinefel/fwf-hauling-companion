@@ -27,34 +27,11 @@ type RouteSummary = {
   total: number
 }
 
-type QuoteRecord = {
-  quoteNumber: string
-  customer: string
-  customerPhone: string
-  customerEmail: string
+type RouteHistoryRecord = {
   pickup: string
   dropoff: string
-  loadDescription: string
-  trailerType: string
-  loadWeightLbs: string
-  loadedKm: number
-  deadheadKm: number
-  driveTime: string
-  loadedCost: number
-  deadheadCost: number
-  minimumChargeAdjustment: number
-  subtotal: number
-  gst: number
+  lookedUpAt: string
   total: number
-  notes?: string
-  createdAt: string
-}
-
-type CustomerRecord = {
-  name: string
-  phone: string
-  email: string
-  notes: string
 }
 
 type Settings = {
@@ -104,6 +81,7 @@ declare global {
 const STORAGE_KEYS = {
   settings: 'fwf-hauling-settings',
   quotes: 'fwf-hauling-quotes',
+  routeHistory: 'fwf-hauling-route-history',
   recentPickup: 'fwf-hauling-recent-pickup',
   recentDropoff: 'fwf-hauling-recent-dropoff',
   customers: 'fwf-hauling-customers',
@@ -375,13 +353,6 @@ const getGoogleRouteSummary = async (origin: string, destination: string) => {
   }
 }
 
-const buildQuoteNumber = (quotes: QuoteRecord[]) => {
-  const today = new Date().toISOString().slice(0, 10).replace(/-/g, '')
-  const todaysQuotes = quotes.filter((quote) => quote.quoteNumber.includes(`FWF-${today}-`))
-  const sequence = String(todaysQuotes.length + 1).padStart(3, '0')
-  return `FWF-${today}-${sequence}`
-}
-
 const calculateSummary = async (
   pickup: string,
   dropoff: string,
@@ -470,8 +441,8 @@ function App() {
     const stored = readJson<Settings>(STORAGE_KEYS.settings, DEFAULT_SETTINGS)
     return { ...DEFAULT_SETTINGS, ...stored }
   })
-  const [quotes, setQuotes] = useState<QuoteRecord[]>(() =>
-    readJson<QuoteRecord[]>(STORAGE_KEYS.quotes, []),
+  const [routeHistory, setRouteHistory] = useState<RouteHistoryRecord[]>(() =>
+    readJson<RouteHistoryRecord[]>(STORAGE_KEYS.routeHistory, []),
   )
   const [recentPickupAddresses, setRecentPickupAddresses] = useState<string[]>(() =>
     readJson<string[]>(STORAGE_KEYS.recentPickup, []),
@@ -479,22 +450,12 @@ function App() {
   const [recentDropoffAddresses, setRecentDropoffAddresses] = useState<string[]>(() =>
     readJson<string[]>(STORAGE_KEYS.recentDropoff, []),
   )
-  const [customers] = useState<CustomerRecord[]>(() =>
-    readJson<CustomerRecord[]>(STORAGE_KEYS.customers, []),
-  )
   const [pickupAddress, setPickupAddress] = useState('')
   const [dropoffAddress, setDropoffAddress] = useState('')
   const [pickupSuggestions, setPickupSuggestions] = useState<string[]>([])
   const [dropoffSuggestions, setDropoffSuggestions] = useState<string[]>([])
   const [pickupSuggestionsVisible, setPickupSuggestionsVisible] = useState(false)
   const [dropoffSuggestionsVisible, setDropoffSuggestionsVisible] = useState(false)
-  const [customerName, setCustomerName] = useState('')
-  const [customerPhone, setCustomerPhone] = useState('')
-  const [customerEmail, setCustomerEmail] = useState('')
-  const [notes, setNotes] = useState('')
-  const [loadDescription, setLoadDescription] = useState('')
-  const [trailerType, setTrailerType] = useState('')
-  const [loadWeightLbs, setLoadWeightLbs] = useState('')
   const [activePage, setActivePage] = useState<'home' | 'history' | 'expenses' | 'settings'>('home')
   const [expenses, setExpenses] = useState<ExpenseRecord[]>(() => readJson<ExpenseRecord[]>(STORAGE_KEYS.expenses, []))
   const [routeSummary, setRouteSummary] = useState<RouteSummary>(DEFAULT_ROUTE_SUMMARY)
@@ -502,7 +463,6 @@ function App() {
   const [isCalculating, setIsCalculating] = useState(false)
   const [googleReady, setGoogleReady] = useState(false)
   const [installPromptEvent, setInstallPromptEvent] = useState<BeforeInstallPromptEvent | null>(null)
-  const [isAdditionalDetailsOpen, setIsAdditionalDetailsOpen] = useState(false)
   const [isMoreFuelDetailsOpen, setIsMoreFuelDetailsOpen] = useState(false)
   const [isRecentPickupOpen, setIsRecentPickupOpen] = useState(false)
   const [isRecentDropoffOpen, setIsRecentDropoffOpen] = useState(false)
@@ -602,24 +562,13 @@ function App() {
     }
   }, [routeSummary, settings])
 
-  const suggestedCustomers = useMemo(() => {
-    const trimmed = customerName.trim().toLowerCase()
-    if (!trimmed) {
-      return []
-    }
-
-    return customers.filter((customer) =>
-      customer.name.toLowerCase().includes(trimmed),
-    )
-  }, [customerName, customers])
-
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(settings))
   }, [settings])
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.quotes, JSON.stringify(quotes))
-  }, [quotes])
+    localStorage.setItem(STORAGE_KEYS.routeHistory, JSON.stringify(routeHistory))
+  }, [routeHistory])
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.recentPickup, JSON.stringify(recentPickupAddresses))
@@ -628,10 +577,6 @@ function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.recentDropoff, JSON.stringify(recentDropoffAddresses))
   }, [recentDropoffAddresses])
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.customers, JSON.stringify(customers))
-  }, [customers])
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.expenses, JSON.stringify(expenses))
@@ -720,14 +665,46 @@ function App() {
   }, [activePage])
 
   useEffect(() => {
+    let active = true
     const updateSummary = async () => {
       setIsCalculating(true)
       const summary = await calculateSummary(pickupAddress, dropoffAddress, settings)
+      if (!active) {
+        return
+      }
       setRouteSummary(summary)
       setIsCalculating(false)
+
+      const pickup = pickupAddress.trim()
+      const dropoff = dropoffAddress.trim()
+      if (pickup && dropoff && summary.total > 0) {
+        setRouteHistory((current) => {
+          const normalizedPickup = pickup.toLowerCase()
+          const normalizedDropoff = dropoff.toLowerCase()
+          const existing = current.find((route) =>
+            route.pickup.trim().toLowerCase() === normalizedPickup &&
+            route.dropoff.trim().toLowerCase() === normalizedDropoff,
+          )
+
+          const updated: RouteHistoryRecord = existing
+            ? { ...existing, pickup, dropoff, total: summary.total }
+            : { pickup, dropoff, lookedUpAt: new Date().toISOString(), total: summary.total }
+
+          return [
+            updated,
+            ...current.filter((route) =>
+              route.pickup.trim().toLowerCase() !== normalizedPickup ||
+              route.dropoff.trim().toLowerCase() !== normalizedDropoff,
+            ),
+          ].slice(0, 30)
+        })
+      }
     }
 
     updateSummary().catch(() => setIsCalculating(false))
+    return () => {
+      active = false
+    }
   }, [pickupAddress, dropoffAddress, settings])
 
   useEffect(() => {
@@ -740,27 +717,28 @@ function App() {
     return () => window.removeEventListener('beforeinstallprompt', onBeforeInstallPrompt)
   }, [])
 
-  const filteredQuotes = useMemo(() => {
+  const filteredRouteHistory = useMemo(() => {
     const term = searchTerm.trim().toLowerCase()
     if (!term) {
-      return quotes
+      return routeHistory
     }
 
-    return quotes.filter((quote) =>
+    return routeHistory.filter((route) =>
       [
-        quote.quoteNumber,
-        quote.customer,
-        quote.pickup,
-        quote.dropoff,
-        quote.loadDescription,
-        quote.trailerType,
-        quote.notes ?? '',
+        route.pickup,
+        route.dropoff,
       ]
         .join(' ')
         .toLowerCase()
         .includes(term),
     )
-  }, [quotes, searchTerm])
+  }, [routeHistory, searchTerm])
+
+  const reuseRoute = (route: RouteHistoryRecord) => {
+    setPickupAddress(route.pickup)
+    setDropoffAddress(route.dropoff)
+    setActivePage('home')
+  }
 
   const voiceCapture = async (setter: (value: string) => void, type: 'pickup' | 'dropoff') => {
     const recognitionCtor = window.SpeechRecognition ?? window.webkitSpeechRecognition
@@ -854,108 +832,6 @@ function App() {
     const previousPickup = pickupAddress
     setPickupAddress(dropoffAddress)
     setDropoffAddress(previousPickup)
-  }
-
-  const applyCustomerSuggestion = (customer: CustomerRecord) => {
-    setCustomerName(customer.name)
-    setCustomerPhone(customer.phone)
-    setCustomerEmail(customer.email)
-    setNotes(customer.notes)
-  }
-
-  const quoteText = (quote: QuoteRecord) =>
-    [
-      `Quote: ${quote.quoteNumber}`,
-      `Customer: ${quote.customer}`,
-      `Phone: ${quote.customerPhone || '—'}`,
-      `Email: ${quote.customerEmail || '—'}`,
-      `Pickup: ${quote.pickup}`,
-      `Drop-off: ${quote.dropoff}`,
-      `Loaded Distance: ${formatKm(quote.loadedKm)}`,
-      `Deadhead Distance: ${formatKm(quote.deadheadKm)}`,
-      `Drive Time: ${quote.driveTime}`,
-      `Loaded Cost: ${formatCurrency(quote.loadedCost)}`,
-      `Deadhead Cost: ${formatCurrency(quote.deadheadCost)}`,
-      `Minimum Charge Adjustment: ${formatCurrency(quote.minimumChargeAdjustment)}`,
-      `Subtotal: ${formatCurrency(quote.subtotal)}`,
-      `GST: ${formatCurrency(quote.gst)}`,
-      `Grand Total: ${formatCurrency(quote.total)}`,
-    ].join('\n')
-
-  const copyQuote = async (quote?: QuoteRecord) => {
-    const selected = quote ?? {
-      quoteNumber: buildQuoteNumber(quotes),
-      customer: customerName || 'Walk-in',
-      customerPhone,
-      customerEmail,
-      pickup: pickupAddress,
-      dropoff: dropoffAddress,
-      loadDescription,
-      trailerType,
-      loadWeightLbs,
-      loadedKm: Number(routeSummary.loadedDistanceKm.toFixed(1)),
-      deadheadKm: Number(routeSummary.deadheadDistanceKm.toFixed(1)),
-      driveTime: `${routeSummary.driveTimeMinutes} min`,
-      loadedCost: Number(routeSummary.loadedCost.toFixed(2)),
-      deadheadCost: Number(routeSummary.deadheadCost.toFixed(2)),
-      minimumChargeAdjustment: Number(routeSummary.minimumChargeAdjustment.toFixed(2)),
-      subtotal: Number(routeSummary.subtotal.toFixed(2)),
-      gst: Number(routeSummary.gst.toFixed(2)),
-      total: Number(routeSummary.total.toFixed(2)),
-      notes,
-      createdAt: new Date().toISOString(),
-    }
-
-    await navigator.clipboard.writeText(quoteText(selected))
-  }
-
-  const shareQuote = async (quote?: QuoteRecord) => {
-    const selected = quote ?? {
-      quoteNumber: buildQuoteNumber(quotes),
-      customer: customerName || 'Walk-in',
-      customerPhone,
-      customerEmail,
-      pickup: pickupAddress,
-      dropoff: dropoffAddress,
-      loadDescription,
-      trailerType,
-      loadWeightLbs,
-      loadedKm: Number(routeSummary.loadedDistanceKm.toFixed(1)),
-      deadheadKm: Number(routeSummary.deadheadDistanceKm.toFixed(1)),
-      driveTime: `${routeSummary.driveTimeMinutes} min`,
-      loadedCost: Number(routeSummary.loadedCost.toFixed(2)),
-      deadheadCost: Number(routeSummary.deadheadCost.toFixed(2)),
-      minimumChargeAdjustment: Number(routeSummary.minimumChargeAdjustment.toFixed(2)),
-      subtotal: Number(routeSummary.subtotal.toFixed(2)),
-      gst: Number(routeSummary.gst.toFixed(2)),
-      total: Number(routeSummary.total.toFixed(2)),
-      notes,
-      createdAt: new Date().toISOString(),
-    }
-
-    if (!navigator.share) {
-      await navigator.clipboard.writeText(quoteText(selected))
-      return
-    }
-
-    await navigator.share({
-      title: `Quote ${selected.quoteNumber}`,
-      text: quoteText(selected),
-    })
-  }
-
-  const duplicateQuote = (quote: QuoteRecord) => {
-    const duplicatedQuote: QuoteRecord = {
-      ...quote,
-      quoteNumber: buildQuoteNumber(quotes),
-      createdAt: new Date().toISOString(),
-    }
-
-    setQuotes((current) => [duplicatedQuote, ...current])
-  }
-
-  const deleteQuote = (quoteNumber: string) => {
-    setQuotes((current) => current.filter((quote) => quote.quoteNumber !== quoteNumber))
   }
 
   return (
@@ -1193,130 +1069,8 @@ function App() {
                     )}
                   </div>
 
-                  <div className="mt-4 grid gap-2 sm:grid-cols-2">
-                    <button
-                      type="button"
-                      onClick={() => copyQuote()}
-                      className="rounded-2xl bg-stone-900 px-4 py-3 text-sm font-semibold text-white"
-                    >
-                      Copy Quote
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => shareQuote()}
-                      className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800"
-                    >
-                      Share Quote
-                    </button>
-                  </div>
                 </section>
 
-                <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
-                  <button
-                    type="button"
-                    onClick={() => setIsAdditionalDetailsOpen((current) => !current)}
-                    className="flex w-full items-center justify-between rounded-2xl bg-stone-100 px-3 py-3 text-left"
-                  >
-                    <span className="text-sm font-semibold text-stone-900">Additional Details</span>
-                    {isAdditionalDetailsOpen ? (
-                      <ChevronUpIcon className="h-5 w-5 text-stone-700" />
-                    ) : (
-                      <ChevronDownIcon className="h-5 w-5 text-stone-700" />
-                    )}
-                  </button>
-
-                  {isAdditionalDetailsOpen && (
-                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                      <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
-                        <span className="mb-2 block text-sm font-semibold">Customer Name</span>
-                        <input
-                          value={customerName}
-                          onChange={(event) => setCustomerName(event.target.value)}
-                          placeholder="Customer name"
-                          className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none transition focus:border-amber-700"
-                        />
-                        {suggestedCustomers.length > 0 && (
-                          <div className="mt-2 rounded-2xl bg-white p-2 shadow-sm ring-1 ring-stone-200">
-                            {suggestedCustomers.slice(0, 4).map((customer) => (
-                              <button
-                                key={`${customer.name}-${customer.phone}`}
-                                type="button"
-                                onClick={() => applyCustomerSuggestion(customer)}
-                                className="flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm hover:bg-stone-100"
-                              >
-                                <span>{customer.name}</span>
-                                <span className="text-stone-500">{customer.phone || customer.email || 'Saved'}</span>
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                      </label>
-
-                      <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
-                        <span className="mb-2 block text-sm font-semibold">Customer Phone</span>
-                        <input
-                          value={customerPhone}
-                          onChange={(event) => setCustomerPhone(event.target.value)}
-                          placeholder="Optional"
-                          className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none transition focus:border-amber-700"
-                        />
-                      </label>
-
-                      <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
-                        <span className="mb-2 block text-sm font-semibold">Customer Email</span>
-                        <input
-                          type="email"
-                          value={customerEmail}
-                          onChange={(event) => setCustomerEmail(event.target.value)}
-                          placeholder="Optional"
-                          className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none transition focus:border-amber-700"
-                        />
-                      </label>
-
-                      <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
-                        <span className="mb-2 block text-sm font-semibold">Notes</span>
-                        <textarea
-                          value={notes}
-                          onChange={(event) => setNotes(event.target.value)}
-                          placeholder="Optional"
-                          rows={3}
-                          className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none transition focus:border-amber-700"
-                        />
-                      </label>
-
-                      <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
-                        <span className="mb-2 block text-sm font-semibold">Trailer Type</span>
-                        <input
-                          value={trailerType}
-                          onChange={(event) => setTrailerType(event.target.value)}
-                          placeholder="Optional"
-                          className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none transition focus:border-amber-700"
-                        />
-                      </label>
-
-                      <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
-                        <span className="mb-2 block text-sm font-semibold">Load Weight (lbs)</span>
-                        <input
-                          type="number"
-                          value={loadWeightLbs}
-                          onChange={(event) => setLoadWeightLbs(event.target.value)}
-                          placeholder="Optional"
-                          className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none transition focus:border-amber-700"
-                        />
-                      </label>
-
-                      <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200 sm:col-span-2">
-                        <span className="mb-2 block text-sm font-semibold">Load Description</span>
-                        <input
-                          value={loadDescription}
-                          onChange={(event) => setLoadDescription(event.target.value)}
-                          placeholder="Optional"
-                          className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none transition focus:border-amber-700"
-                        />
-                      </label>
-                    </div>
-                  )}
-                </section>
 
                 <div className="mt-3 grid gap-2">
                   <div className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200">
@@ -1433,60 +1187,39 @@ function App() {
             </div>
 
             <div className="grid gap-3">
-              {filteredQuotes.map((quote) => (
-                <article key={quote.quoteNumber} className="rounded-2xl bg-stone-50 p-4 ring-1 ring-stone-200">
+              {filteredRouteHistory.map((route) => (
+                <article
+                  key={`${route.pickup}-${route.dropoff}-${route.lookedUpAt}`}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => reuseRoute(route)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      reuseRoute(route)
+                    }
+                  }}
+                  className="cursor-pointer rounded-2xl bg-stone-50 p-4 ring-1 ring-stone-200"
+                >
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                     <div>
-                      <p className="text-sm font-bold text-stone-900">{quote.quoteNumber}</p>
-                      <p className="text-sm text-stone-700">Customer: {quote.customer}</p>
-                      <p className="text-sm text-stone-700">Pickup: {quote.pickup}</p>
-                      <p className="text-sm text-stone-700">Drop-off: {quote.dropoff}</p>
+                      <p className="text-sm text-stone-700">Pickup: {route.pickup}</p>
+                      <p className="text-sm text-stone-700">Drop-off: {route.dropoff}</p>
+                      <p className="mt-2 text-xs text-stone-500">
+                        {new Date(route.lookedUpAt).toLocaleString()}
+                      </p>
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() => duplicateQuote(quote)}
-                        className="rounded-full bg-stone-900 px-3 py-2 text-xs font-semibold text-white"
-                      >
-                        Duplicate
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => copyQuote(quote)}
-                        className="rounded-full bg-stone-900 px-3 py-2 text-xs font-semibold text-white"
-                      >
-                        Copy
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => shareQuote(quote)}
-                        className="rounded-full bg-stone-200 px-3 py-2 text-xs font-semibold text-stone-800"
-                      >
-                        Share
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => deleteQuote(quote.quoteNumber)}
-                        className="rounded-full bg-rose-100 px-3 py-2 text-xs font-semibold text-rose-700"
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </div>
-                  <div className="mt-3 grid gap-2 text-sm text-stone-700 sm:grid-cols-3">
-                    <span>Loaded km: {quote.loadedKm}</span>
-                    <span>Deadhead km: {quote.deadheadKm}</span>
-                    <span>Drive time: {quote.driveTime}</span>
-                  </div>
-                  <div className="mt-3 flex flex-wrap gap-3 text-sm font-semibold text-stone-900">
-                    <span>Loaded Cost: {formatCurrency(quote.loadedCost)}</span>
-                    <span>Deadhead Cost: {formatCurrency(quote.deadheadCost)}</span>
-                    <span>Subtotal: {formatCurrency(quote.subtotal)}</span>
-                    <span>GST: {formatCurrency(quote.gst)}</span>
-                    <span>Total: {formatCurrency(quote.total)}</span>
+                    <span className="text-sm font-semibold text-stone-900">
+                      Total: {formatCurrency(route.total)}
+                    </span>
                   </div>
                 </article>
               ))}
+              {filteredRouteHistory.length === 0 && (
+                <p className="rounded-2xl bg-stone-50 p-4 text-sm text-stone-500 ring-1 ring-stone-200">
+                  No route history found.
+                </p>
+              )}
             </div>
           </section>
         )}
