@@ -14,7 +14,8 @@ import {
 } from '@heroicons/react/24/outline'
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader'
 import ExpenseTracker, { type ExpenseRecord } from './ExpenseTracker'
-
+import { initializeLocalExpenses, saveLocalExpenses, synchronizeExpenses } from './expenseSync'
+import { supabase } from './supabase'
 type RouteSummary = {
   loadedDistanceKm: number
   deadheadDistanceKm: number
@@ -458,6 +459,10 @@ function App() {
   const [dropoffSuggestionsVisible, setDropoffSuggestionsVisible] = useState(false)
   const [activePage, setActivePage] = useState<'home' | 'history' | 'expenses' | 'settings'>('home')
   const [expenses, setExpenses] = useState<ExpenseRecord[]>(() => readJson<ExpenseRecord[]>(STORAGE_KEYS.expenses, []))
+  const expensesRef = useRef(expenses)
+  const initialExpensesRef = useRef(expenses)
+  const localExpensesReadyRef = useRef<Promise<ExpenseRecord[]> | null>(null)
+  const syncExpensesRef = useRef<(() => void) | null>(null)
   const [routeSummary, setRouteSummary] = useState<RouteSummary>(DEFAULT_ROUTE_SUMMARY)
   const [searchTerm, setSearchTerm] = useState('')
   const [isCalculating, setIsCalculating] = useState(false)
@@ -466,6 +471,23 @@ function App() {
   const [isMoreFuelDetailsOpen, setIsMoreFuelDetailsOpen] = useState(false)
   const [isRecentPickupOpen, setIsRecentPickupOpen] = useState(false)
   const [isRecentDropoffOpen, setIsRecentDropoffOpen] = useState(false)
+
+  const getLocalExpenses = useCallback(() => {
+    if (!localExpensesReadyRef.current) {
+      localExpensesReadyRef.current = initializeLocalExpenses(
+        readJson<ExpenseRecord[]>(STORAGE_KEYS.expenses, []),
+      )
+    }
+    return localExpensesReadyRef.current
+  }, [])
+
+  const handleExpensesChange = useCallback(async (nextExpenses: ExpenseRecord[]) => {
+    await getLocalExpenses()
+    await saveLocalExpenses(nextExpenses, expensesRef.current)
+    expensesRef.current = nextExpenses
+    setExpenses(nextExpenses)
+    syncExpensesRef.current?.()
+  }, [getLocalExpenses])
 
   const refreshSuggestions = useCallback(
     async (field: 'pickup' | 'dropoff', value: string) => {
@@ -563,6 +585,70 @@ function App() {
   }, [routeSummary, settings])
 
   useEffect(() => {
+    let active = true
+    let syncing = false
+    let channel: ReturnType<typeof supabase.channel> | null = null
+
+    const synchronize = async () => {
+      if (!active || syncing) return
+      syncing = true
+      try {
+        const localExpenses = await getLocalExpenses()
+        if (expensesRef.current === initialExpensesRef.current) {
+          expensesRef.current = localExpenses
+          setExpenses(localExpenses)
+        }
+
+        const { data, error } = await supabase.auth.getSession()
+        if (error) throw error
+        if (!data.session) {
+          const { error: signInError } = await supabase.auth.signInAnonymously()
+          if (signInError) throw signInError
+        }
+
+        if (!channel) {
+          channel = supabase
+            .channel('fwf-expenses-sync')
+            .on('postgres_changes', {
+              event: '*',
+              schema: 'public',
+              table: 'fwf_expenses',
+            }, () => {
+              if (!syncing) void synchronize()
+            })
+            .subscribe((status) => {
+              if (status === 'SUBSCRIBED' && !syncing) void synchronize()
+            })
+        }
+
+        const synchronizedExpenses = await synchronizeExpenses()
+        if (active) {
+          expensesRef.current = synchronizedExpenses
+          setExpenses(synchronizedExpenses)
+        }
+      } catch (error) {
+        console.error('Expense synchronization failed:', error)
+      } finally {
+        syncing = false
+      }
+    }
+
+    const retrySynchronization = () => { void synchronize() }
+    window.addEventListener('online', retrySynchronization)
+    const retryTimer = window.setInterval(retrySynchronization, 30_000)
+    syncExpensesRef.current = retrySynchronization
+    retrySynchronization()
+
+    return () => {
+      active = false
+      window.removeEventListener('online', retrySynchronization)
+      window.clearInterval(retryTimer)
+      syncExpensesRef.current = null
+      if (channel) void supabase.removeChannel(channel)
+    }
+  }, [getLocalExpenses])
+
+  useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(settings))
   }, [settings])
 
@@ -577,10 +663,6 @@ function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEYS.recentDropoff, JSON.stringify(recentDropoffAddresses))
   }, [recentDropoffAddresses])
-
-  useEffect(() => {
-    localStorage.setItem(STORAGE_KEYS.expenses, JSON.stringify(expenses))
-  }, [expenses])
 
   useEffect(() => {
     const loadGoogle = async () => {
@@ -1225,7 +1307,7 @@ function App() {
         )}
 
         {activePage === 'expenses' && (
-          <ExpenseTracker expenses={expenses} onExpensesChange={setExpenses} />
+          <ExpenseTracker expenses={expenses} onExpensesChange={handleExpensesChange} />
         )}
 
         <nav className="sticky bottom-3 mt-4 grid grid-cols-4 gap-2 rounded-2xl bg-white p-2 shadow-sm ring-1 ring-stone-200">

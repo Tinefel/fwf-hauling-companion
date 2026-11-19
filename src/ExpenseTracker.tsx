@@ -24,7 +24,7 @@ type ExpenseRecord = {
 
 type ExpenseTrackerProps = {
   expenses: ExpenseRecord[]
-  onExpensesChange: (expenses: ExpenseRecord[]) => void
+  onExpensesChange: (expenses: ExpenseRecord[]) => Promise<void>
 }
 
 type ExpenseDraft = Omit<ExpenseRecord, 'id' | 'createdAt'>
@@ -300,7 +300,9 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
       return expense.category === category ? expense : { ...expense, category }
     })
     if (migrated.some((expense, index) => expense.category !== expenses[index].category)) {
-      onExpensesChange(migrated)
+      void onExpensesChange(migrated).catch((error: unknown) => {
+        console.error('Could not save normalized expenses locally:', error)
+      })
     }
   }, [expenses, onExpensesChange])
 
@@ -328,9 +330,15 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   }
   const captureButtonClass = `flex flex-col items-center justify-center rounded-2xl bg-stone-50 p-5 text-center ring-1 ring-stone-200 transition ${isScanning ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-amber-50'}`
   const updateDraft = (field: keyof ExpenseDraft, value: string) => setDraft((current) => current ? { ...current, [field]: value } : current)
-  const saveExpense = () => {
+  const saveExpense = async () => {
     if (!draft?.attachmentData) return
-    onExpensesChange([{ ...draft, id: crypto.randomUUID(), createdAt: new Date().toISOString() }, ...expenses]); setDraft(null); setRetryFile(null); setProcessingMessage('')
+    try {
+      await onExpensesChange([{ ...draft, id: crypto.randomUUID(), createdAt: new Date().toISOString() }, ...expenses])
+      setDraft(null); setRetryFile(null); setProcessingMessage('')
+    } catch (error) {
+      console.error('Could not save expense locally:', error)
+      setReceiptError(error instanceof Error ? error.message : 'Could not save expense locally.')
+    }
   }
   const startEdit = (expense: ExpenseRecord) => {
     setSelectedExpense(null)
@@ -363,21 +371,31 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
       setReceiptError(error instanceof Error ? error.message : 'Could not replace the receipt attachment.')
     }
   }
-  const saveEditedExpense = () => {
+  const saveEditedExpense = async () => {
     if (!editingExpenseId || !editingDraft) return
-    onExpensesChange(expenses.map((expense) => expense.id === editingExpenseId ? { ...editingDraft, id: expense.id, createdAt: expense.createdAt } : expense))
-    setEditingExpenseId(null)
-    setEditingDraft(null)
+    try {
+      await onExpensesChange(expenses.map((expense) => expense.id === editingExpenseId ? { ...editingDraft, id: expense.id, createdAt: expense.createdAt } : expense))
+      setEditingExpenseId(null)
+      setEditingDraft(null)
+    } catch (error) {
+      console.error('Could not save edited expense locally:', error)
+      setReceiptError(error instanceof Error ? error.message : 'Could not save edited expense locally.')
+    }
   }
   const cancelEdit = () => {
     setEditingExpenseId(null)
     setEditingDraft(null)
   }
-  const confirmDelete = () => {
+  const confirmDelete = async () => {
     if (!deleteExpenseId) return
-    onExpensesChange(expenses.filter((expense) => expense.id !== deleteExpenseId))
-    setDeleteExpenseId(null)
-    setExpenseMenuId(null)
+    try {
+      await onExpensesChange(expenses.filter((expense) => expense.id !== deleteExpenseId))
+      setDeleteExpenseId(null)
+      setExpenseMenuId(null)
+    } catch (error) {
+      console.error('Could not save expense deletion locally:', error)
+      setReceiptError(error instanceof Error ? error.message : 'Could not save expense deletion locally.')
+    }
   }
   const clearFilters = () => {
     setMerchantSearch('')
@@ -424,6 +442,7 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   if (editingExpenseId && editingDraft) return (
     <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
       <div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Saved expense</p><h2 className="text-2xl font-black text-stone-900">Edit Expense</h2></div><PencilSquareIcon className="h-5 w-5 text-amber-900" /></div>
+      {receiptError && <p role="alert" className="mb-3 text-sm text-red-700">{receiptError}</p>}
       <div className="grid gap-3 sm:grid-cols-2">{[['merchant', 'Merchant / Supplier'], ['date', 'Expense date'], ['subtotal', 'Subtotal'], ['gst', 'GST'], ['pst', 'PST'], ['total', 'Total']].map(([field, label]) => <label key={field} className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">{label}</span><input type={field === 'date' ? 'date' : field === 'merchant' ? 'text' : 'number'} step={field === 'merchant' ? undefined : '0.01'} value={editingDraft[field as keyof ExpenseDraft]} onChange={(event) => updateEditingDraft(field as keyof ExpenseDraft, event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none focus:border-amber-700" /></label>)}
         <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Expense category</span><select value={editingDraft.category} onChange={(event) => updateEditingDraft('category', event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none">{CATEGORIES.map((category) => <option key={category}>{category}</option>)}</select></label>
         <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200 sm:col-span-2"><span className="mb-2 block text-sm font-semibold">Description / Notes</span><textarea value={editingDraft.description} onChange={(event) => updateEditingDraft('description', event.target.value)} rows={3} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none" /></label>
@@ -447,6 +466,7 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   if (draft) return (
     <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
       <div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Review before saving</p><h2 className="text-2xl font-black text-stone-900">Check receipt details</h2><p className="mt-1 text-sm text-stone-500">Confirm or edit every extracted field before saving.</p><p className="mt-2 text-sm font-semibold text-emerald-700">{processingMessage}</p></div><PencilSquareIcon className="h-5 w-5 text-amber-900" /></div>
+      {receiptError && <p role="alert" className="mb-3 text-sm text-red-700">{receiptError}</p>}
       <div className="grid gap-3 sm:grid-cols-2">{[['merchant', 'Merchant'], ['date', 'Date'], ['subtotal', 'Subtotal'], ['gst', 'GST'], ['pst', 'PST'], ['total', 'Total'], ['invoiceNumber', 'Receipt number'], ['paymentMethod', 'Payment method']].map(([field, label]) => <label key={field} className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">{label}</span><input type={field === 'date' ? 'date' : 'text'} value={draft[field as keyof ExpenseDraft]} onChange={(event) => updateDraft(field as keyof ExpenseDraft, event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none focus:border-amber-700" /></label>)}
         <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Category</span><select value={draft.category} onChange={(event) => updateDraft('category', event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none">{CATEGORIES.map((category) => <option key={category}>{category}</option>)}</select></label>
         <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200 sm:col-span-2"><span className="mb-2 block text-sm font-semibold">Description</span><textarea value={draft.description} onChange={(event) => updateDraft('description', event.target.value)} rows={3} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none" /></label>
@@ -505,6 +525,7 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
           <div className="w-full max-w-sm rounded-[24px] bg-white p-5 shadow-xl ring-1 ring-stone-200">
             <h2 className="text-lg font-black text-stone-900">Delete expense?</h2>
             <p className="mt-2 text-sm text-stone-600">Are you sure you want to permanently delete this expense?</p>
+            {receiptError && <p role="alert" className="mt-3 text-sm text-red-700">{receiptError}</p>}
             <div className="mt-5 flex justify-end gap-3"><button type="button" onClick={() => setDeleteExpenseId(null)} className="rounded-xl bg-stone-200 px-4 py-2 text-sm font-semibold text-stone-800">Cancel</button><button type="button" onClick={confirmDelete} className="rounded-xl bg-red-700 px-4 py-2 text-sm font-semibold text-white">Delete</button></div>
           </div>
         </div>
