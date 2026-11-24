@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { CameraIcon, CheckCircleIcon, DocumentArrowUpIcon, DocumentTextIcon, EllipsisHorizontalIcon, PencilSquareIcon, PhotoIcon, ReceiptPercentIcon, TrashIcon, TruckIcon } from '@heroicons/react/24/outline'
+import JSZip from 'jszip'
+import { jsPDF } from 'jspdf'
+import * as XLSX from 'xlsx'
 import type { ExtractedReceipt, ReceiptApiResponse, ReceiptTimings } from './receiptTypes'
+import { supabase } from './supabase'
 
-type ExpenseRecord = {
+export type ExpenseRecord = {
   id: string
   merchant: string
   date: string
@@ -20,6 +24,14 @@ type ExpenseRecord = {
   attachmentType: string
   attachmentData: string
   createdAt: string
+}
+
+type CategoryTotals = {
+  category: string
+  count: number
+  total: number
+  gst: number
+  pst: number
 }
 
 type ExpenseTrackerProps = {
@@ -258,9 +270,189 @@ const receiptToDraft = (receipt: ExtractedReceipt, isPdf: boolean): Partial<Expe
   description: isPdf ? `${receipt.vendor ?? 'Invoice'} - ${receipt.category} items` : '',
 })
 const formatAmount = (value: string) => value && Number.isFinite(Number(value)) ? new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(Number(value)) : '—'
+const amountInCents = (value: string) => {
+  const normalized = value.trim()
+  if (!normalized || !Number.isFinite(Number(normalized))) return 0
+  const match = /^([+-]?)(\d*)(?:\.(\d*))?(?:e([+-]?\d+))?$/i.exec(normalized)
+  if (!match) return 0
+  const [, sign, integerPart, fractionPart = '', exponentPart = '0'] = match
+  const digits = `${integerPart || '0'}${fractionPart}`.replace(/^0+(?=\d)/, '')
+  const centsScale = 2 - fractionPart.length + Number(exponentPart)
+  let cents: bigint
+  if (centsScale >= 0) {
+    cents = BigInt(digits) * (10n ** BigInt(centsScale))
+  } else {
+    const divisor = 10n ** BigInt(-centsScale)
+    const amount = BigInt(digits)
+    cents = amount / divisor
+    if ((amount % divisor) * 2n >= divisor) cents += 1n
+  }
+  const result = Number(cents) * (sign === '-' ? -1 : 1)
+  return Number.isSafeInteger(result) ? result : 0
+}
+const formatCents = (value: number) => formatAmount((value / 100).toFixed(2))
+const exportAmount = (value: string) => value.trim() && Number.isFinite(Number(value)) ? amountInCents(value) / 100 : ''
+const formatCurrencyColumns = (sheet: XLSX.WorkSheet, columns: number[], rows: number) => {
+  columns.forEach((column) => {
+    for (let row = 1; row <= rows; row += 1) {
+      const cell = sheet[XLSX.utils.encode_cell({ r: row, c: column })]
+      if (cell?.t === 'n') cell.z = '"$"#,##0.00'
+    }
+  })
+}
 const dateLabel = (value: string) => value ? new Date(`${value}T00:00:00`).toLocaleDateString('en-CA', { dateStyle: 'medium' }) : '—'
 const monthLabel = (value: string) => value === 'Unknown date' ? value : new Date(`${value}-01T00:00:00`).toLocaleDateString('en-CA', { month: 'long', year: 'numeric' })
 const expenseTotal = (expense: ExpenseRecord) => Number.isFinite(Number(expense.total)) ? Number(expense.total) : 0
+const formatTaxValue = (value: string) => value.trim() && Number.isFinite(Number(value)) ? formatCents(amountInCents(value)) : 'Missing'
+const isValidExpenseDate = (value: string) => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
+  const date = new Date(`${value}T00:00:00Z`)
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value
+}
+const escapeFilePart = (value: string) => value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'Unknown'
+const dataUrlToBlob = (dataUrl: string) => {
+  const separator = dataUrl.indexOf(',')
+  if (!dataUrl.startsWith('data:') || separator < 0) throw new Error('A saved receipt has invalid data')
+  const metadata = dataUrl.slice(5, separator)
+  const payload = dataUrl.slice(separator + 1)
+  const binary = metadata.endsWith(';base64') ? atob(payload) : decodeURIComponent(payload)
+  return new Blob([Uint8Array.from(binary, (character) => character.charCodeAt(0))], {
+    type: metadata.split(';')[0] || 'application/octet-stream',
+  })
+}
+const triggerDownload = (blob: Blob, filename: string) => {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  document.body.append(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
+}
+const buildQuarterlyPdf = (
+  quarter: string,
+  year: string,
+  expenses: ExpenseRecord[],
+  unknownDateExpenses: ExpenseRecord[],
+  totals: { total: number; gst: number; pst: number },
+  categories: CategoryTotals[],
+) => {
+  const pdf = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'letter' })
+  const pageWidth = pdf.internal.pageSize.getWidth()
+  const pageHeight = pdf.internal.pageSize.getHeight()
+  const margin = 36
+  const columns = [
+    { label: 'Date', width: 52 },
+    { label: 'Merchant', width: 100 },
+    { label: 'Category', width: 105 },
+    { label: 'Description', width: 190 },
+    { label: 'Subtotal', width: 58 },
+    { label: 'GST', width: 50 },
+    { label: 'PST', width: 50 },
+    { label: 'Total', width: 65 },
+  ]
+  const drawTransactionTable = (rows: ExpenseRecord[], title: string) => {
+    let y = 40
+    pdf.setFont('helvetica', 'bold')
+    pdf.setFontSize(15)
+    pdf.text(title, margin, y)
+    y += 14
+    pdf.setFontSize(7)
+    const drawHeader = () => {
+      pdf.setFillColor(120, 53, 15)
+      pdf.rect(margin, y, pageWidth - margin * 2, 19, 'F')
+      pdf.setTextColor(255, 255, 255)
+      pdf.setFont('helvetica', 'bold')
+      let x = margin + 4
+      columns.forEach((column) => {
+        pdf.text(column.label, x, y + 12)
+        x += column.width
+      })
+      pdf.setTextColor(35, 35, 35)
+      y += 19
+    }
+    drawHeader()
+    rows.forEach((expense, index) => {
+      const values = [
+        isValidExpenseDate(expense.date) ? dateLabel(expense.date) : 'Unknown date',
+        expense.merchant || 'Unnamed merchant',
+        canonicalCategory(expense.category),
+        expense.description || '—',
+        expense.subtotal.trim() ? formatTaxValue(expense.subtotal) : '—',
+        formatTaxValue(expense.gst),
+        formatTaxValue(expense.pst),
+        expense.total.trim() ? formatTaxValue(expense.total) : '—',
+      ]
+      const wrapped = values.map((value, valueIndex) => pdf.splitTextToSize(value, columns[valueIndex].width - 7) as string[])
+      const rowHeight = Math.max(19, ...wrapped.map((lines) => lines.length * 8 + 7))
+      if (y + rowHeight > pageHeight - margin) {
+        pdf.addPage()
+        y = 40
+        drawHeader()
+      }
+      if (index % 2 === 1) {
+        pdf.setFillColor(250, 247, 242)
+        pdf.rect(margin, y, pageWidth - margin * 2, rowHeight, 'F')
+      }
+      let x = margin + 4
+      wrapped.forEach((lines, valueIndex) => {
+        pdf.setFont('helvetica', 'normal')
+        pdf.setFontSize(7)
+        pdf.text(lines, x, y + 10)
+        x += columns[valueIndex].width
+      })
+      y += rowHeight
+    })
+  }
+
+  pdf.setFillColor(120, 53, 15)
+  pdf.rect(0, 0, pageWidth, 112, 'F')
+  pdf.setTextColor(255, 255, 255)
+  pdf.setFont('helvetica', 'bold')
+  pdf.setFontSize(22)
+  pdf.text('FWF Hauling', margin, 38)
+  pdf.setFontSize(13)
+  pdf.text(`${quarter} ${year} Quarterly Expense Report`, margin, 60)
+  pdf.setFont('helvetica', 'normal')
+  pdf.setFontSize(9)
+  pdf.text(`Transactions: ${expenses.length}  |  Total expenses: ${formatCents(totals.total)}  |  GST: ${formatCents(totals.gst)}  |  PST: ${formatCents(totals.pst)}`, margin, 82)
+
+  let y = 139
+  pdf.setTextColor(35, 35, 35)
+  pdf.setFont('helvetica', 'bold')
+  pdf.setFontSize(12)
+  pdf.text('Category summary', margin, y)
+  y += 16
+  pdf.setFontSize(8)
+  pdf.text('Category', margin, y)
+  pdf.text('Expenses', margin + 220, y)
+  pdf.text('GST', margin + 330, y)
+  pdf.text('PST', margin + 430, y)
+  y += 5
+  categories.forEach((category) => {
+    y += 14
+    pdf.setFont('helvetica', 'normal')
+    pdf.text(category.category, margin, y)
+    pdf.text(`${formatCents(category.total)} (${category.count})`, margin + 220, y)
+    pdf.text(formatCents(category.gst), margin + 330, y)
+    pdf.text(formatCents(category.pst), margin + 430, y)
+  })
+  if (unknownDateExpenses.length > 0) {
+    y += 22
+    pdf.setTextColor(153, 27, 27)
+    pdf.setFont('helvetica', 'bold')
+    pdf.text(`${unknownDateExpenses.length} expense${unknownDateExpenses.length === 1 ? '' : 's'} are listed under Expenses requiring date review and excluded from quarter totals.`, margin, y)
+  }
+
+  pdf.addPage()
+  drawTransactionTable(expenses, 'Individual expenses')
+  if (unknownDateExpenses.length > 0) {
+    pdf.addPage()
+    drawTransactionTable(unknownDateExpenses, 'Expenses requiring date review')
+  }
+  return pdf.output('blob')
+}
 const sortedByExpenseDate = (items: ExpenseRecord[]) => [...items].sort((a, b) => {
   const dateDifference = b.date.localeCompare(a.date)
   return dateDifference || b.createdAt.localeCompare(a.createdAt)
@@ -281,6 +473,11 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   const [monthFilter, setMonthFilter] = useState('')
   const [yearFilter, setYearFilter] = useState('')
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(() => new Set())
+  const [selectedQuarter, setSelectedQuarter] = useState(() => `Q${Math.floor(new Date().getMonth() / 3) + 1}`)
+  const [selectedQuarterYear, setSelectedQuarterYear] = useState(() => String(new Date().getFullYear()))
+  const [isExporting, setIsExporting] = useState(false)
+  const [exportMessage, setExportMessage] = useState('')
+  const [exportError, setExportError] = useState('')
   const [editingExpenseId, setEditingExpenseId] = useState<string | null>(null)
   const [editingDraft, setEditingDraft] = useState<ExpenseDraft | null>(null)
   const [deleteExpenseId, setDeleteExpenseId] = useState<string | null>(null)
@@ -293,18 +490,6 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
     const documentInput = fileInputs[2]
     if (documentInput) documentInput.accept = 'application/pdf,.pdf,image/jpeg,image/png,image/heic,image/heif,.heic,.heif'
   }, [])
-
-  useEffect(() => {
-    const migrated = expenses.map((expense) => {
-      const category = canonicalCategory(expense.category)
-      return expense.category === category ? expense : { ...expense, category }
-    })
-    if (migrated.some((expense, index) => expense.category !== expenses[index].category)) {
-      void onExpensesChange(migrated).catch((error: unknown) => {
-        console.error('Could not save normalized expenses locally:', error)
-      })
-    }
-  }, [expenses, onExpensesChange])
 
   const selectReceipt = async (file: File) => {
     if (isScanning) return
@@ -418,8 +603,199 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   const filteredTotal = filteredExpenses.reduce((sum, expense) => sum + expenseTotal(expense), 0)
   const categoryGroups = CATEGORIES.map((category) => {
     const items = filteredExpenses.filter((expense) => canonicalCategory(expense.category) === category)
-    return { category, items, total: items.reduce((sum, expense) => sum + expenseTotal(expense), 0) }
+    return {
+      category,
+      items,
+      total: items.reduce((sum, expense) => sum + amountInCents(expense.total), 0),
+      gst: items.reduce((sum, expense) => sum + amountInCents(expense.gst), 0),
+      pst: items.reduce((sum, expense) => sum + amountInCents(expense.pst), 0),
+    }
   }).filter((group) => group.items.length > 0)
+  const quarterNumber = Number(selectedQuarter.slice(1))
+  const quarterStartMonth = (quarterNumber - 1) * 3 + 1
+  const quarterStart = `${selectedQuarterYear}-${String(quarterStartMonth).padStart(2, '0')}-01`
+  const quarterEndMonth = quarterStartMonth + 3
+  const quarterEnd = quarterEndMonth > 12
+    ? `${Number(selectedQuarterYear) + 1}-01-01`
+    : `${selectedQuarterYear}-${String(quarterEndMonth).padStart(2, '0')}-01`
+  const quarterExpenses = expenses.filter((expense) => (
+    isValidExpenseDate(expense.date) && expense.date >= quarterStart && expense.date < quarterEnd
+  ))
+  const quarterCategories = CATEGORIES.map((category) => {
+    const items = quarterExpenses.filter((expense) => canonicalCategory(expense.category) === category)
+    return {
+      category,
+      count: items.length,
+      total: items.reduce((sum, expense) => sum + amountInCents(expense.total), 0),
+      gst: items.reduce((sum, expense) => sum + amountInCents(expense.gst), 0),
+      pst: items.reduce((sum, expense) => sum + amountInCents(expense.pst), 0),
+    }
+  })
+  const quarterYears = [...new Set([String(new Date().getFullYear()), ...expenses
+    .filter((expense) => isValidExpenseDate(expense.date))
+    .map((expense) => expense.date.slice(0, 4))])]
+    .sort((a, b) => b.localeCompare(a))
+  const quarterTotal = quarterExpenses.reduce((sum, expense) => sum + amountInCents(expense.total), 0)
+  const quarterGst = quarterExpenses.reduce((sum, expense) => sum + amountInCents(expense.gst), 0)
+  const quarterPst = quarterExpenses.reduce((sum, expense) => sum + amountInCents(expense.pst), 0)
+  const unknownDateExpenses = expenses.filter((expense) => !isValidExpenseDate(expense.date))
+  const quarterTotals = { total: quarterTotal, gst: quarterGst, pst: quarterPst }
+  const exportAccountantFiles = async () => {
+    setIsExporting(true)
+    setExportMessage('')
+    setExportError('')
+    try {
+      const quarterLabel = `${selectedQuarter}-${selectedQuarterYear}`
+      const transactionRows = [
+        ['Date', 'Merchant', 'Category', 'Description', 'Subtotal', 'GST', 'PST', 'Total expense', 'Receipt filename or reference'],
+        ...quarterExpenses.map((expense) => [
+          expense.date,
+          expense.merchant,
+          canonicalCategory(expense.category),
+          expense.description,
+          exportAmount(expense.subtotal),
+          exportAmount(expense.gst),
+          exportAmount(expense.pst),
+          exportAmount(expense.total),
+          expense.attachmentName || (expense.attachmentData ? 'Receipt attached' : ''),
+        ]),
+      ]
+      const unknownRows = unknownDateExpenses.length > 0
+        ? [
+            [],
+            ['Expenses requiring date review'],
+            transactionRows[0],
+            ...unknownDateExpenses.map((expense) => [
+              expense.date || 'Unknown date',
+              expense.merchant,
+              canonicalCategory(expense.category),
+              expense.description,
+              exportAmount(expense.subtotal),
+              exportAmount(expense.gst),
+              exportAmount(expense.pst),
+              exportAmount(expense.total),
+              expense.attachmentName || (expense.attachmentData ? 'Receipt attached' : ''),
+            ]),
+          ]
+        : []
+      const workbook = XLSX.utils.book_new()
+      const individualSheet = XLSX.utils.aoa_to_sheet([...transactionRows, ...unknownRows])
+      individualSheet['!cols'] = [{ wch: 14 }, { wch: 24 }, { wch: 34 }, { wch: 38 }, { wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 32 }]
+      formatCurrencyColumns(individualSheet, [4, 5, 6, 7], transactionRows.length + unknownRows.length)
+      XLSX.utils.book_append_sheet(workbook, individualSheet, 'Individual Expenses')
+      const categoryRows = [
+        ['Category', 'Number of expenses', 'Total expenses', 'Total GST', 'Total PST'],
+        ...quarterCategories.map(({ category, count, total, gst, pst }) => [category, count, total / 100, gst / 100, pst / 100]),
+      ]
+      const categorySheet = XLSX.utils.aoa_to_sheet(categoryRows)
+      formatCurrencyColumns(categorySheet, [2, 3, 4], categoryRows.length)
+      XLSX.utils.book_append_sheet(workbook, categorySheet, 'Category Summary')
+      const summarySheet = XLSX.utils.aoa_to_sheet([
+        ['Quarter', selectedQuarter],
+        ['Year', Number(selectedQuarterYear)],
+        ['Total expenses', quarterTotal / 100],
+        ['Total GST', quarterGst / 100],
+        ['Total PST', quarterPst / 100],
+        ['Number of transactions', quarterExpenses.length],
+        ['Unknown dates for review (excluded from totals)', unknownDateExpenses.length],
+      ])
+      for (const cellAddress of ['B3', 'B4', 'B5']) {
+        const cell = summarySheet[cellAddress]
+        if (cell?.t === 'n') cell.z = '"$"#,##0.00'
+      }
+      XLSX.utils.book_append_sheet(workbook, summarySheet, 'Quarterly Tax Summary')
+      const spreadsheet = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
+
+      const receiptsZip = new JSZip()
+      const seenReceiptHashes = new Set<string>()
+      const receiptFailures: string[] = []
+      const receiptPathsByExpense = new Map<string, string>()
+      if (quarterExpenses.length > 0) {
+        const { data: receiptRecords, error } = await supabase
+          .from('fwf_expenses')
+          .select('id, receipt_path')
+          .in('id', quarterExpenses.map((expense) => expense.id))
+          .eq('deleted', false)
+        if (error) throw new Error(`Could not check Supabase receipt references: ${error.message}`)
+        receiptRecords?.forEach((record) => {
+          if (record.receipt_path) receiptPathsByExpense.set(record.id, record.receipt_path)
+        })
+      }
+      for (const expense of quarterExpenses) {
+        let receiptBlob: Blob | null = null
+        let storageError: unknown
+        const receiptPath = receiptPathsByExpense.get(expense.id) ?? `${expense.id}/receipt`
+        try {
+          const { data, error } = await supabase.storage.from('expense-receipts').download(receiptPath)
+          if (error) storageError = error
+          else receiptBlob = data
+        } catch (error) {
+          storageError = error
+        }
+        let localAttachmentError: unknown
+        if (!receiptBlob && expense.attachmentData) {
+          try {
+            receiptBlob = dataUrlToBlob(expense.attachmentData)
+          } catch (error) {
+            localAttachmentError = error
+          }
+        }
+        if (!receiptBlob) {
+          const missingStorageObject = typeof storageError === 'object'
+            && storageError !== null
+            && 'statusCode' in storageError
+            && String(storageError.statusCode) === '404'
+          const hasReceiptReference = Boolean(receiptPathsByExpense.has(expense.id) || expense.attachmentData || expense.attachmentName)
+          if (hasReceiptReference || (storageError && !missingStorageObject)) {
+            const reason = localAttachmentError instanceof Error
+              ? localAttachmentError.message
+              : storageError instanceof Error
+              ? storageError.message
+              : storageError && typeof storageError === 'object' && 'message' in storageError
+                ? String(storageError.message)
+                : 'receipt could not be retrieved'
+            receiptFailures.push(`${expense.merchant || 'Unnamed merchant'} (expense ${expense.id}): ${reason}`)
+          }
+          continue
+        }
+        try {
+          const bytes = await receiptBlob.arrayBuffer()
+          const digest = await crypto.subtle.digest('SHA-256', bytes)
+          const receiptHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+          if (seenReceiptHashes.has(receiptHash)) continue
+          seenReceiptHashes.add(receiptHash)
+          const originalName = expense.attachmentName || `receipt${expense.attachmentType === 'application/pdf' ? '.pdf' : ''}`
+          const receiptName = `${isValidExpenseDate(expense.date) ? expense.date : 'unknown-date'}_${escapeFilePart(expense.merchant)}_${escapeFilePart(expense.id.slice(0, 8))}_${escapeFilePart(originalName)}`
+          receiptsZip.file(receiptName, bytes)
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : 'receipt could not be added to the ZIP'
+          receiptFailures.push(`${expense.merchant || 'Unnamed merchant'} (expense ${expense.id}): ${reason}`)
+        }
+      }
+      if (receiptFailures.length > 0) {
+        receiptsZip.file('Receipt retrieval issues.txt', [
+          'Receipts that could not be retrieved:',
+          ...receiptFailures.map((failure) => `- ${failure}`),
+          '',
+        ].join('\n'))
+      }
+      const receiptArchive = await receiptsZip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } })
+      const report = buildQuarterlyPdf(selectedQuarter, selectedQuarterYear, quarterExpenses, unknownDateExpenses, quarterTotals, quarterCategories)
+
+      triggerDownload(report, `FWF-Hauling-${quarterLabel}-Quarterly-Report.pdf`)
+      triggerDownload(new Blob([spreadsheet], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `FWF-Hauling-${quarterLabel}-Expenses.xlsx`)
+      triggerDownload(receiptArchive, `FWF-Hauling-${quarterLabel}-Receipts.zip`)
+      setExportMessage(`Downloads created for ${selectedQuarter} ${selectedQuarterYear}.`)
+      if (receiptFailures.length > 0) {
+        setExportError(`Some receipts could not be retrieved; see "Receipt retrieval issues.txt" in the ZIP:\n${receiptFailures.join('\n')}`)
+      }
+    } catch (error) {
+      console.error('Could not export accountant files:', error)
+      setExportError(error instanceof Error ? error.message : 'Could not create the accountant export.')
+    } finally {
+      setIsExporting(false)
+    }
+  }
   const monthlyTotals = [...filteredExpenses.reduce((totals, expense) => {
     const month = expense.date.slice(0, 7) || 'Unknown date'
     totals.set(month, (totals.get(month) ?? 0) + expenseTotal(expense))
@@ -509,15 +885,41 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
       <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(260px,1fr)]">
         <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
           <div className="mb-4 flex items-center justify-between"><p className="text-sm font-semibold text-stone-900">Expenses by category</p><span className="text-xs text-stone-500">Newest first</span></div>
-          {categoryGroups.length === 0 ? <p className="rounded-2xl bg-stone-50 p-5 text-sm text-stone-500">No expenses match the selected filters.</p> : <div className="space-y-3">{categoryGroups.map(({ category, items, total }) => {
-            const isExpanded = !expandedCategories.has(category)
-            return <div key={category} className="overflow-hidden rounded-2xl ring-1 ring-stone-200"><button type="button" onClick={() => toggleCategory(category)} aria-expanded={isExpanded} className="flex w-full items-center justify-between gap-3 bg-stone-50 p-4 text-left"><span><span className="block font-semibold text-stone-900">{category}</span><span className="mt-1 block text-xs text-stone-500">{items.length} expense{items.length === 1 ? '' : 's'}</span></span><span className="flex items-center gap-3"><span className="font-bold text-amber-900">{formatAmount(total.toFixed(2))}</span><span className="text-stone-500">{isExpanded ? '−' : '+'}</span></span></button>{isExpanded && <div className="grid gap-2 p-3">{items.map((expense) => <div key={expense.id} className="relative flex rounded-xl bg-white ring-1 ring-stone-200"><button type="button" onTouchStart={() => { longPressActivated.current = false; if (longPressTimer.current) clearTimeout(longPressTimer.current); longPressTimer.current = setTimeout(() => { longPressActivated.current = true; setExpenseMenuId(expense.id) }, 650) }} onTouchEnd={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current) }} onTouchCancel={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current) }} onContextMenu={(event) => { event.preventDefault(); setExpenseMenuId(expense.id) }} onClick={() => { if (longPressActivated.current) { longPressActivated.current = false; return } startEdit(expense) }} className="grid min-w-0 flex-1 gap-1 p-4 text-left transition hover:bg-amber-50 sm:grid-cols-[1fr,1fr,auto] sm:items-center"><span className="font-semibold text-stone-900">{dateLabel(expense.date)}</span><span className="text-sm text-stone-700">{expense.merchant || 'Unnamed merchant'}</span><span className="font-bold text-amber-900">{formatAmount(expense.total)}</span></button><button type="button" aria-label={`Expense options for ${expense.merchant || 'Unnamed merchant'}`} onClick={() => setExpenseMenuId((current) => current === expense.id ? null : expense.id)} className="flex w-12 shrink-0 items-center justify-center rounded-r-xl text-stone-600 hover:bg-stone-100"><EllipsisHorizontalIcon className="h-6 w-6" /></button>{expenseMenuId === expense.id && <div className="absolute right-3 top-12 z-20 w-36 rounded-xl bg-white p-1 shadow-lg ring-1 ring-stone-200"><button type="button" onClick={() => startEdit(expense)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-stone-800 hover:bg-stone-100"><PencilSquareIcon className="h-4 w-4" />Edit</button><button type="button" onClick={() => { setExpenseMenuId(null); setDeleteExpenseId(expense.id) }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-red-700 hover:bg-red-50"><TrashIcon className="h-4 w-4" />Delete</button></div>}</div>)}</div>}</div>
+          {categoryGroups.length === 0 ? <p className="rounded-2xl bg-stone-50 p-5 text-sm text-stone-500">No expenses match the selected filters.</p> : <div className="space-y-3">{categoryGroups.map(({ category, items, total, gst, pst }) => {
+            const isExpanded = expandedCategories.has(category)
+            return <div key={category} className="overflow-hidden rounded-2xl ring-1 ring-stone-200"><button type="button" onClick={() => toggleCategory(category)} aria-expanded={isExpanded} className="flex w-full items-center justify-between gap-3 bg-stone-50 p-4 text-left"><span><span className="block font-semibold text-stone-900">{category}</span><span className="mt-1 block text-xs text-stone-500">{items.length} expense{items.length === 1 ? '' : 's'}</span><span className="mt-1 block text-xs text-stone-600">GST: {formatCents(gst)} <span className="mx-1">|</span> PST: {formatCents(pst)}</span></span><span className="flex items-center gap-3"><span className="font-bold text-amber-900">{formatCents(total)}</span><span className="text-stone-500">{isExpanded ? '−' : '+'}</span></span></button>{isExpanded && <div className="grid gap-2 p-3">{items.map((expense) => <div key={expense.id} className="relative flex rounded-xl bg-white ring-1 ring-stone-200"><button type="button" onTouchStart={() => { longPressActivated.current = false; if (longPressTimer.current) clearTimeout(longPressTimer.current); longPressTimer.current = setTimeout(() => { longPressActivated.current = true; setExpenseMenuId(expense.id) }, 650) }} onTouchEnd={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current) }} onTouchCancel={() => { if (longPressTimer.current) clearTimeout(longPressTimer.current) }} onContextMenu={(event) => { event.preventDefault(); setExpenseMenuId(expense.id) }} onClick={() => { if (longPressActivated.current) { longPressActivated.current = false; return } startEdit(expense) }} className="grid min-w-0 flex-1 gap-1 p-4 text-left transition hover:bg-amber-50 sm:grid-cols-[1fr,1fr,auto] sm:items-center"><span className="font-semibold text-stone-900">{dateLabel(expense.date)}</span><span className="text-sm text-stone-700">{expense.merchant || 'Unnamed merchant'}</span><span className="font-bold text-amber-900">{formatAmount(expense.total)}</span></button><button type="button" aria-label={`Expense options for ${expense.merchant || 'Unnamed merchant'}`} onClick={() => setExpenseMenuId((current) => current === expense.id ? null : expense.id)} className="flex w-12 shrink-0 items-center justify-center rounded-r-xl text-stone-600 hover:bg-stone-100"><EllipsisHorizontalIcon className="h-6 w-6" /></button>{expenseMenuId === expense.id && <div className="absolute right-3 top-12 z-20 w-36 rounded-xl bg-white p-1 shadow-lg ring-1 ring-stone-200"><button type="button" onClick={() => startEdit(expense)} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-stone-800 hover:bg-stone-100"><PencilSquareIcon className="h-4 w-4" />Edit</button><button type="button" onClick={() => { setExpenseMenuId(null); setDeleteExpenseId(expense.id) }} className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm font-semibold text-red-700 hover:bg-red-50"><TrashIcon className="h-4 w-4" />Delete</button></div>}</div>)}</div>}</div>
           })}</div>}
         </div>
         <div className="space-y-4">
           <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200"><p className="mb-3 text-sm font-semibold text-stone-900">Monthly spending</p>{monthlyTotals.length === 0 ? <p className="text-sm text-stone-500">No monthly totals.</p> : <div className="space-y-2">{monthlyTotals.map(([month, total]) => <div key={month} className="flex items-center justify-between rounded-xl bg-stone-50 px-3 py-2"><span className="text-sm text-stone-700">{monthLabel(month)}</span><span className="font-bold text-amber-900">{formatAmount(total.toFixed(2))}</span></div>)}</div>}</div>
           <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200"><p className="mb-3 text-sm font-semibold text-stone-900">Yearly spending</p>{yearlyTotals.length === 0 ? <p className="text-sm text-stone-500">No yearly totals.</p> : <div className="space-y-2">{yearlyTotals.map(([year, total]) => <div key={year} className="flex items-center justify-between rounded-xl bg-stone-50 px-3 py-2"><span className="text-sm text-stone-700">{year}</span><span className="font-bold text-amber-900">{formatAmount(total.toFixed(2))}</span></div>)}</div>}</div>
         </div>
+      </div>
+      <div className="mb-4 rounded-2xl bg-amber-50 p-4 ring-1 ring-amber-200">
+        <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+          <div><p className="text-xs font-semibold uppercase tracking-wide text-amber-900">Quarterly tax summary</p><h3 className="mt-1 text-lg font-black text-amber-950">{selectedQuarter} {selectedQuarterYear}</h3></div>
+          <div className="flex gap-2">
+            <label className="text-sm font-semibold text-stone-700"><span className="sr-only">Quarter</span><select aria-label="Quarter" value={selectedQuarter} onChange={(event) => setSelectedQuarter(event.target.value)} className="rounded-xl border border-stone-300 bg-white px-3 py-2"><option value="Q1">Q1 (January–March)</option><option value="Q2">Q2 (April–June)</option><option value="Q3">Q3 (July–September)</option><option value="Q4">Q4 (October–December)</option></select></label>
+            <label className="text-sm font-semibold text-stone-700"><span className="sr-only">Year</span><select aria-label="Year" value={selectedQuarterYear} onChange={(event) => setSelectedQuarterYear(event.target.value)} className="rounded-xl border border-stone-300 bg-white px-3 py-2">{quarterYears.map((year) => <option key={year}>{year}</option>)}</select></label>
+          </div>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div className="rounded-xl bg-white p-3"><p className="text-xs font-semibold text-stone-500">Total expenses</p><p className="mt-1 font-black text-stone-900">{formatCents(quarterTotal)}</p></div>
+          <div className="rounded-xl bg-white p-3"><p className="text-xs font-semibold text-stone-500">Total GST</p><p className="mt-1 font-black text-stone-900">{formatCents(quarterGst)}</p></div>
+          <div className="rounded-xl bg-white p-3"><p className="text-xs font-semibold text-stone-500">Total PST</p><p className="mt-1 font-black text-stone-900">{formatCents(quarterPst)}</p></div>
+        </div>
+        <div className="mt-4 overflow-x-auto">
+          <table className="w-full min-w-[480px] text-left text-sm">
+            <thead><tr className="text-xs text-stone-500"><th className="pb-2 pr-3 font-semibold">Category</th><th className="pb-2 pr-3 font-semibold">Expenses</th><th className="pb-2 pr-3 font-semibold">GST</th><th className="pb-2 font-semibold">PST</th></tr></thead>
+            <tbody>{quarterCategories.map(({ category, count, total, gst, pst }) => <tr key={category} className="border-t border-amber-100"><th className="py-2 pr-3 font-semibold text-stone-800">{category}</th><td className="py-2 pr-3 text-stone-700">{formatCents(total)} <span className="text-xs text-stone-500">({count})</span></td><td className="py-2 pr-3 text-stone-700">{formatCents(gst)}</td><td className="py-2 text-stone-700">{formatCents(pst)}</td></tr>)}</tbody>
+          </table>
+        </div>
+        {exportError && <p role="alert" className="mt-3 text-sm text-red-800">{exportError}</p>}
+        {exportMessage && <p role="status" className="mt-3 text-sm font-semibold text-emerald-800">{exportMessage}</p>}
+        <button type="button" onClick={() => void exportAccountantFiles()} disabled={isExporting} className="mt-4 flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-amber-900 px-4 py-3 text-center text-sm font-bold text-white transition hover:bg-amber-950 disabled:cursor-wait disabled:opacity-70">
+          <DocumentArrowUpIcon className="h-5 w-5" />
+          {isExporting ? 'Preparing Accountant Export…' : 'Accountant Export / Download'}
+        </button>
       </div>
       </section>
       {deleteExpenseId && (
@@ -534,5 +936,4 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   )
 }
 
-export type { ExpenseRecord }
 export default ExpenseTracker

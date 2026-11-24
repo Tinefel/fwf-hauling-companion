@@ -16,8 +16,10 @@
     "@heroicons/react": "^2.2.0",
     "@supabase/supabase-js": "^2.119.1",
     "jspdf": "^4.2.1",
+    "jszip": "^3.10.2",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
