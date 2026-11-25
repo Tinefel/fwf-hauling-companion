@@ -3,7 +3,6 @@ import { CameraIcon, CheckCircleIcon, DocumentArrowUpIcon, DocumentTextIcon, Ell
 import JSZip from 'jszip'
 import * as XLSX from 'xlsx'
 import type { ExtractedReceipt, ReceiptApiResponse, ReceiptTimings } from './receiptTypes'
-import { findDuplicateMatches, getExpenseWarnings, type DuplicateMatch, type ExpenseWarning } from './expenseReview'
 
 export type ExpenseRecord = {
   id: string
@@ -297,6 +296,12 @@ const isValidExpenseDate = (value: string) => {
   const date = new Date(`${value}T00:00:00Z`)
   return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value
 }
+const isValidRequiredAmount = (value: string) => {
+  const normalized = value.trim()
+  if (!/^(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(normalized)) return false
+  const amount = Number(normalized)
+  return Number.isFinite(amount) && Number.isSafeInteger(Math.round(amount * 100))
+}
 const triggerDownload = (blob: Blob, filename: string) => {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
@@ -478,35 +483,8 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   const [editingDraft, setEditingDraft] = useState<ExpenseDraft | null>(null)
   const [deleteExpenseId, setDeleteExpenseId] = useState<string | null>(null)
   const [expenseMenuId, setExpenseMenuId] = useState<string | null>(null)
-  const [duplicateMatches, setDuplicateMatches] = useState<DuplicateMatch[]>([])
-  const [duplicateScanError, setDuplicateScanError] = useState('')
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const longPressActivated = useRef(false)
-
-  useEffect(() => {
-    let active = true
-    const compareReceipts = async () => {
-      try {
-        const imageEntries = await Promise.all(expenses
-          .filter((expense) => expense.attachmentData)
-          .map(async (expense) => {
-            const attachment = attachmentFromDataUrl(expense.attachmentData, expense.attachmentType)
-            return [expense.id, await sha256(attachment.bytes)] as const
-          }))
-        if (active) {
-          setDuplicateMatches(findDuplicateMatches(expenses, new Map(imageEntries)))
-          setDuplicateScanError('')
-        }
-      } catch (error) {
-        if (active) {
-          setDuplicateMatches(findDuplicateMatches(expenses, new Map()))
-          setDuplicateScanError(errorMessage(error, 'Saved receipt images could not be compared.'))
-        }
-      }
-    }
-    void compareReceipts()
-    return () => { active = false }
-  }, [expenses])
 
   useEffect(() => {
     const fileInputs = document.querySelectorAll<HTMLInputElement>('input[type="file"]')
@@ -538,8 +516,22 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   }
   const captureButtonClass = `flex flex-col items-center justify-center rounded-2xl bg-stone-50 p-5 text-center ring-1 ring-stone-200 transition ${isScanning ? 'cursor-not-allowed opacity-50' : 'cursor-pointer hover:bg-amber-50'}`
   const updateDraft = (field: keyof ExpenseDraft, value: string) => setDraft((current) => current ? { ...current, [field]: value } : current)
+  const startManualEntry = () => {
+    setReceiptError('')
+    setRetryFile(null)
+    setProcessingMessage('Enter the subtotal and GST amount. PST is optional.')
+    setDraft({ ...emptyDraft, category: '' })
+  }
   const saveExpense = async () => {
-    if (!draft?.attachmentData) return
+    if (!draft) return
+    if (!isValidRequiredAmount(draft.subtotal)) {
+      setReceiptError('Subtotal is missing or invalid.')
+      return
+    }
+    if (!isValidRequiredAmount(draft.gst)) {
+      setReceiptError('GST is missing or invalid.')
+      return
+    }
     try {
       await onExpensesChange([{ ...draft, id: crypto.randomUUID(), createdAt: new Date().toISOString() }, ...expenses])
       setDraft(null); setRetryFile(null); setProcessingMessage('')
@@ -822,12 +814,6 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
     else next.add(category)
     return next
   })
-  const draftWarnings: ExpenseWarning[] = draft
-    ? getExpenseWarnings({ ...draft, id: 'draft', createdAt: '' })
-    : []
-  const expenseWarnings = expenses.flatMap((expense) => getExpenseWarnings(expense)
-    .map((warning) => ({ expense, warning })))
-
   if (editingExpenseId && editingDraft) return (
     <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
       <div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Saved expense</p><h2 className="text-2xl font-black text-stone-900">Edit Expense</h2></div><PencilSquareIcon className="h-5 w-5 text-amber-900" /></div>
@@ -854,14 +840,13 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
 
   if (draft) return (
     <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
-      <div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Review before saving</p><h2 className="text-2xl font-black text-stone-900">Check receipt details</h2><p className="mt-1 text-sm text-stone-500">Confirm or edit every extracted field before saving.</p><p className="mt-2 text-sm font-semibold text-emerald-700">{processingMessage}</p></div><PencilSquareIcon className="h-5 w-5 text-amber-900" /></div>
+      <div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">{draft.attachmentData ? 'Review before saving' : 'Manual entry'}</p><h2 className="text-2xl font-black text-stone-900">{draft.attachmentData ? 'Check receipt details' : 'New Expense'}</h2><p className="mt-1 text-sm text-stone-500">{draft.attachmentData ? 'Subtotal and GST are required; PST is optional.' : 'Enter expense details. Subtotal and GST are required; PST and receipt attachment are optional.'}</p><p className="mt-2 text-sm font-semibold text-emerald-700">{processingMessage}</p></div><PencilSquareIcon className="h-5 w-5 text-amber-900" /></div>
       {receiptError && <p role="alert" className="mb-3 text-sm text-red-700">{receiptError}</p>}
-      {draftWarnings.length > 0 && <div role="status" className="mb-4 rounded-2xl bg-amber-50 p-4 text-sm text-amber-950 ring-1 ring-amber-200"><p className="font-bold">Review the flagged receipt details before saving</p><ul className="mt-2 list-inside list-disc space-y-1">{draftWarnings.map((warning, index) => <li key={`${warning.category}-${index}`}>{warning.message}</li>)}</ul></div>}
-      <div className="grid gap-3 sm:grid-cols-2">{[['merchant', 'Merchant'], ['date', 'Date'], ['subtotal', 'Subtotal'], ['gst', 'GST'], ['pst', 'PST'], ['total', 'Total'], ['invoiceNumber', 'Receipt number'], ['paymentMethod', 'Payment method']].map(([field, label]) => <label key={field} className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">{label}</span><input type={field === 'date' ? 'date' : 'text'} value={draft[field as keyof ExpenseDraft]} onChange={(event) => updateDraft(field as keyof ExpenseDraft, event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none focus:border-amber-700" /></label>)}
-        <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Category</span><select value={draft.category} onChange={(event) => updateDraft('category', event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none">{!draft.category && <option value="">Select category — review receipt</option>}{CATEGORIES.map((category) => <option key={category}>{category}</option>)}</select></label>
+      <div className="grid gap-3 sm:grid-cols-2">{[['merchant', 'Merchant'], ['date', 'Date'], ['subtotal', 'Subtotal'], ['gst', 'GST'], ['pst', 'PST (optional)'], ['total', 'Total'], ['invoiceNumber', 'Receipt number'], ['paymentMethod', 'Payment method']].map(([field, label]) => <label key={field} className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">{label}</span><input type={field === 'date' ? 'date' : ['subtotal', 'gst', 'pst', 'total'].includes(field) ? 'number' : 'text'} step={['subtotal', 'gst', 'pst', 'total'].includes(field) ? '0.01' : undefined} value={draft[field as keyof ExpenseDraft]} onChange={(event) => updateDraft(field as keyof ExpenseDraft, event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none focus:border-amber-700" /></label>)}
+        <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Category</span><select value={draft.category} onChange={(event) => updateDraft('category', event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none">{!draft.category && <option value="">Select category</option>}{CATEGORIES.map((category) => <option key={category}>{category}</option>)}</select></label>
         <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200 sm:col-span-2"><span className="mb-2 block text-sm font-semibold">Description</span><textarea value={draft.description} onChange={(event) => updateDraft('description', event.target.value)} rows={3} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none" /></label>
       </div>
-      <div className="mt-5 flex flex-wrap items-center gap-3"><button type="button" onClick={() => setDraft(null)} className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800">Cancel</button><button type="button" onClick={saveExpense} className="flex items-center gap-2 rounded-2xl bg-amber-900 px-4 py-3 text-sm font-semibold text-white"><CheckCircleIcon className="h-5 w-5" /> Save Expense</button><span className="text-xs text-stone-500">Attached: {draft.attachmentName}</span></div>
+      <div className="mt-5 flex flex-wrap items-center gap-3"><button type="button" onClick={() => setDraft(null)} className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800">Cancel</button><button type="button" onClick={saveExpense} className="flex items-center gap-2 rounded-2xl bg-amber-900 px-4 py-3 text-sm font-semibold text-white"><CheckCircleIcon className="h-5 w-5" /> Save Expense</button>{draft.attachmentName && <span className="text-xs text-stone-500">Attached: {draft.attachmentName}</span>}</div>
     </section>
   )
 
@@ -872,7 +857,7 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
       <section className="space-y-4">
       <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
         <div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Business records</p><h2 className="text-2xl font-black text-stone-900">Expenses</h2><p className="mt-1 text-sm text-stone-500">Keep each receipt attached to its expense.</p></div><ReceiptPercentIcon className="h-7 w-7 text-amber-900" /></div>
-        <div className="grid gap-3 md:grid-cols-3"><label aria-disabled={isScanning} className={captureButtonClass}><CameraIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Take a Photo</span><input type="file" accept="image/*" capture="environment" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label aria-disabled={isScanning} className={captureButtonClass}><PhotoIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Choose Photo</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label aria-disabled={isScanning} className={captureButtonClass}><DocumentArrowUpIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Upload Document</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label></div>
+        <div className="grid gap-3 md:grid-cols-3"><label aria-disabled={isScanning} className={captureButtonClass}><CameraIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Take a Photo</span><input type="file" accept="image/*" capture="environment" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label aria-disabled={isScanning} className={captureButtonClass}><PhotoIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Choose Photo</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><label aria-disabled={isScanning} className={captureButtonClass}><DocumentArrowUpIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Upload Document</span><input type="file" accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif" disabled={isScanning} className="sr-only" onChange={(event) => event.target.files?.[0] && selectReceipt(event.target.files[0])} /></label><button type="button" disabled={isScanning} onClick={startManualEntry} className={`${captureButtonClass} disabled:cursor-not-allowed disabled:opacity-50`}><PencilSquareIcon className="h-7 w-7 text-amber-900" /><span className="mt-2 text-sm font-bold">Enter Manually</span></button></div>
         {scan && <ScanStatus key={scan.previewUrl ?? scan.fileName} scan={scan} />}
         {receiptError && <div role="alert" className="mt-4 flex flex-wrap items-center gap-3 text-sm text-red-700"><p>{receiptError}</p>{retryFile && <button type="button" onClick={() => selectReceipt(retryFile)} className="rounded-xl bg-red-100 px-3 py-2 font-semibold text-red-800">Retry</button>}</div>}
       </div>
@@ -895,52 +880,6 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
           <div className="rounded-2xl bg-stone-50 p-4 ring-1 ring-stone-200"><p className="text-xs font-semibold uppercase tracking-wide text-stone-500">Yearly totals</p><p className="mt-1 text-xl font-black text-stone-900">{yearlyTotals.length}</p></div>
         </div>
       </div>
-
-      <section aria-label="Expense warnings and duplicate review" className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
-        <div className="mb-4">
-          <p className="text-sm font-semibold text-stone-900">Warnings &amp; duplicate review</p>
-          <p className="mt-1 text-sm text-stone-500">Warnings never change or remove an expense. Review each flagged record manually.</p>
-        </div>
-        {duplicateScanError && <p role="alert" className="mb-3 rounded-xl bg-red-50 p-3 text-sm text-red-800">{duplicateScanError}</p>}
-        {duplicateMatches.length === 0 && expenseWarnings.length === 0
-          ? <p className="rounded-xl bg-stone-50 p-3 text-sm text-stone-600">No warnings found in the loaded expenses.</p>
-          : <div className="space-y-4">
-            {duplicateMatches.map(({ first, second, confirmed }) => (
-              <article key={`${first.id}-${second.id}`} className="rounded-2xl bg-amber-50 p-4 ring-1 ring-amber-200">
-                <h3 className="font-bold text-amber-950">{confirmed ? 'Confirmed duplicate receipt' : 'Possible duplicate transaction'}</h3>
-                <p className="mt-1 text-sm text-amber-900">{confirmed
-                  ? 'These transactions have identical saved receipt image data.'
-                  : 'Merchant, date, and amount are similar. Compare the receipts; this is not confirmation of a duplicate.'}</p>
-                <div className="mt-3 grid gap-3 md:grid-cols-2">
-                  {[first, second].map((expense) => (
-                    <div key={expense.id} className="min-w-0 rounded-xl bg-white p-3 ring-1 ring-amber-200">
-                      <p className="font-semibold text-stone-900">{expense.merchant || 'Unnamed merchant'}</p>
-                      <p className="mt-1 text-sm text-stone-600">{dateLabel(expense.date)} · {formatAmount(expense.total)} · {canonicalCategory(expense.category)}</p>
-                      <div className="mt-3 flex min-h-36 items-center justify-center overflow-hidden rounded-lg bg-stone-100">
-                        {expense.attachmentData
-                          ? expense.attachmentType === 'application/pdf'
-                            ? <iframe title={`Receipt for ${expense.merchant || 'unnamed merchant'}`} src={expense.attachmentData} className="h-56 w-full" />
-                            : <img src={expense.attachmentData} alt={`Receipt for ${expense.merchant || 'unnamed merchant'}`} className="max-h-64 w-full object-contain" />
-                          : <p className="p-3 text-sm text-stone-500">Receipt image is not available in the loaded expense data.</p>}
-                      </div>
-                      <button type="button" onClick={() => startEdit(expense)} className="mt-3 rounded-xl bg-amber-900 px-3 py-2 text-sm font-semibold text-white">Review transaction</button>
-                    </div>
-                  ))}
-                </div>
-              </article>
-            ))}
-            {expenseWarnings.map(({ expense, warning }, index) => (
-              <div key={`${expense.id}-${warning.category}-${index}`} className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-stone-50 p-3 ring-1 ring-stone-200">
-                <div>
-                  <p className="text-xs font-bold uppercase tracking-wide text-amber-900">{warning.category === 'missing' ? 'Missing / unreadable information' : `${warning.category.toUpperCase()} needs review`}</p>
-                  <p className="mt-1 text-sm text-stone-800">{warning.message}</p>
-                  <p className="mt-1 text-xs text-stone-500">{expense.merchant || 'Unnamed merchant'} · {dateLabel(expense.date)} · {formatAmount(expense.total)}</p>
-                </div>
-                <button type="button" onClick={() => startEdit(expense)} className="rounded-xl bg-stone-200 px-3 py-2 text-sm font-semibold text-stone-800">Review transaction</button>
-              </div>
-            ))}
-          </div>}
-      </section>
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(260px,1fr)]">
         <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
