@@ -15,7 +15,7 @@ import {
 import { importLibrary, setOptions } from '@googlemaps/js-api-loader'
 import ExpenseTracker, { type ExpenseRecord } from './ExpenseTracker'
 import { initializeLocalExpenses, saveLocalExpenses, synchronizeExpenses } from './expenseSync'
-import { supabase } from './supabase'
+import { ensureAnonymousSession, supabase } from './supabase'
 type RouteSummary = {
   loadedDistanceKm: number
   deadheadDistanceKm: number
@@ -599,12 +599,7 @@ function App() {
           setExpenses(localExpenses)
         }
 
-        const { data, error } = await supabase.auth.getSession()
-        if (error) throw error
-        if (!data.session) {
-          const { error: signInError } = await supabase.auth.signInAnonymously()
-          if (signInError) throw signInError
-        }
+        await ensureAnonymousSession()
 
         if (!channel) {
           channel = supabase

@@ -24,26 +24,6 @@ const BODY_TIMEOUT_MS = 5_000
 const IMAGE_MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'] as const
 type ImageMediaType = typeof IMAGE_MEDIA_TYPES[number]
 
-export const normalizeReceiptAmounts = (receipt: ExtractedReceipt): ExtractedReceipt => {
-  const total = typeof receipt.total === 'number' && Number.isFinite(receipt.total) && receipt.total >= 0 ? receipt.total : null
-  const isPlausibleTax = (value: number | null) => value == null || (Number.isFinite(value) && value >= 0 && (total == null || value <= total))
-  const gst = isPlausibleTax(receipt.gst) ? receipt.gst : null
-  const subtotal = typeof receipt.subtotal === 'number' && Number.isFinite(receipt.subtotal) && receipt.subtotal >= 0 ? receipt.subtotal : null
-  const explicitPst = isPlausibleTax(receipt.pst) ? receipt.pst : null
-  const pst = explicitPst ?? (total != null && gst != null && subtotal != null && Math.abs(total - gst - subtotal) <= 0.02 ? 0 : null)
-  const taxTotal = gst != null && pst != null ? gst + pst : null
-  const hasCompleteAmounts = total != null && taxTotal != null && taxTotal <= total + 0.02
-  const calculatedSubtotal = hasCompleteAmounts ? Math.max(0, total - taxTotal) : null
-
-  return {
-    ...receipt,
-    subtotal: calculatedSubtotal ?? subtotal,
-    gst,
-    pst,
-    total,
-  }
-}
-
 const nullableString = { type: ['string', 'null'] }
 const nullableNumber = { type: ['number', 'null'] }
 
@@ -64,19 +44,21 @@ const saveReceiptTool: Anthropic.Tool = {
       pst: nullableNumber,
       total: nullableNumber,
       paymentMethod: { anyOf: [{ type: 'string', enum: Object.keys(PAYMENT_CODES) }, { type: 'null' }] },
-      category: { type: 'string', enum: Object.keys(CATEGORY_CODES) },
+      category: { anyOf: [{ type: 'string', enum: Object.keys(CATEGORY_CODES) }, { type: 'null' }] },
     },
     required: ['vendor', 'date', 'receiptNumber', 'subtotal', 'gst', 'pst', 'total', 'paymentMethod', 'category'],
   },
 }
 
-const SYSTEM_PROMPT = `Extract Canadian receipts and invoices with save_receipt.
-- vendor: business name without Inc./Ltd.
-- gst = GST/HST amount; pst = PST/QST amount. Never use a tax registration number as an amount. subtotal + gst + pst = total.
-- Fuel receipts list litres and price per litre; those are not totals.
-- Numeric dates are month/day/year.
+const SYSTEM_PROMPT = `Read the receipt and use save_receipt to capture only these fields: merchant name, transaction date, expense category, subtotal, GST, PST, and total, plus receipt number and payment method when shown. Do not return purchased-item descriptions or line-item breakdowns.
+- Copy amounts exactly as printed. Do not calculate, infer, or fill in missing values. Use null for any missing, unreadable, or ambiguous field.
+- gst = GST/HST amount; pst = PST/QST amount. Never use a tax registration number as an amount.
+- For Manitoba gasoline and diesel, GST generally applies and PST does not. If no PST is shown, use null; do not infer or add PST.
+- Do not assume other purchases include both taxes. Record only the taxes shown.
+- Identify the date only when unambiguous; use YYYY-MM-DD. Do not assume a numeric date order when unclear.
+- Fuel receipts list litres and price per litre; those are not receipt totals.
 - paymentMethod: on_account for charge / net-terms invoices.
-- category: repairs for shop labour or repair work.`
+- category: repairs for shop labour or repair work. Use null when the category cannot be determined.`
 
 // Runtime check of Claude's tool input against ExtractedReceipt (strict mode should guarantee it; this keeps the type honest).
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -89,10 +71,10 @@ export const parseExtractedReceipt = (input: unknown): ExtractedReceipt | null =
   if (!isRecord(input)) return null
   const { vendor, date, subtotal, gst, pst, total, category, paymentMethod, receiptNumber } = input
   if (!isNullableString(vendor) || !isNullableString(date) || !isNullableNumber(subtotal) || !isNullableNumber(gst) || !isNullableNumber(pst)
-    || !isNullableNumber(total) || !isCategoryCode(category) || !(paymentMethod === null || isPaymentCode(paymentMethod)) || !isNullableString(receiptNumber)) return null
+    || !isNullableNumber(total) || !(category === null || isCategoryCode(category)) || !(paymentMethod === null || isPaymentCode(paymentMethod)) || !isNullableString(receiptNumber)) return null
   return {
     vendor, date, subtotal, gst, pst, total, receiptNumber,
-    category: CATEGORY_CODES[category],
+    category: category === null ? null : CATEGORY_CODES[category],
     paymentMethod: paymentMethod === null ? null : PAYMENT_CODES[paymentMethod],
   }
 }
@@ -199,5 +181,5 @@ export async function POST(request: Request) {
   const extracted = toolUse ? parseExtractedReceipt(toolUse.input) : null
   timings.parseMs = Date.now() - parseStartedAt
   if (!extracted) return respond({ error: 'Claude returned receipt data in an unexpected format. Please try again.' }, 502)
-  return respond(normalizeReceiptAmounts(extracted))
+  return respond(extracted)
 }

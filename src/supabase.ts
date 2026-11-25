@@ -8,4 +8,25 @@ export const supabase = createClient(
   supabaseUrl,
     supabasePublishableKey
     )
+
+export const RECEIPTS_BUCKET = 'expense-receipts'
+
+let anonymousSignInPromise: Promise<void> | null = null
+
+export const ensureAnonymousSession = async () => {
+  const { data, error } = await supabase.auth.getSession()
+  if (error) throw error
+  if (data.session) return
+
+  if (!anonymousSignInPromise) {
+    anonymousSignInPromise = supabase.auth.signInAnonymously()
+      .then(({ error: signInError }) => {
+        if (signInError) throw signInError
+      })
+      .finally(() => {
+        anonymousSignInPromise = null
+      })
+  }
+  await anonymousSignInPromise
+}
     

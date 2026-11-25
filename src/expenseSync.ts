@@ -1,4 +1,4 @@
-import { supabase } from './supabase'
+import { ensureAnonymousSession, RECEIPTS_BUCKET, supabase } from './supabase'
 import type { ExpenseRecord } from './ExpenseTracker'
 
 const DATABASE_NAME = 'fwf-hauling-expenses'
@@ -6,8 +6,6 @@ const DATABASE_VERSION = 1
 const RECORDS_STORE = 'records'
 const OUTBOX_STORE = 'outbox'
 const EXPENSES_TABLE = 'fwf_expenses'
-const RECEIPTS_BUCKET = 'expense-receipts'
-
 type LocalRecord = {
   id: string
   expense: ExpenseRecord
@@ -231,6 +229,7 @@ const uploadPendingRecord = async (local: LocalRecord) => {
 }
 
 export const synchronizeExpenses = async () => {
+  await ensureAnonymousSession()
   const remoteRecords = await getRemoteExpenses()
   const localRecords = await readAll<LocalRecord>(RECORDS_STORE)
   const pendingRecords = await readAll<LocalRecord>(OUTBOX_STORE)

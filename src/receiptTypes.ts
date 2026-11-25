@@ -15,7 +15,7 @@ export interface ExtractedReceipt {
   gst: number | null
   pst: number | null
   total: number | null
-  category: ReceiptCategory
+  category: ReceiptCategory | null
   paymentMethod: ReceiptPaymentMethod | null
   receiptNumber: string | null
 }

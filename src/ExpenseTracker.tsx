@@ -1,10 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { CameraIcon, CheckCircleIcon, DocumentArrowUpIcon, DocumentTextIcon, EllipsisHorizontalIcon, PencilSquareIcon, PhotoIcon, ReceiptPercentIcon, TrashIcon, TruckIcon } from '@heroicons/react/24/outline'
 import JSZip from 'jszip'
-import { jsPDF } from 'jspdf'
 import * as XLSX from 'xlsx'
 import type { ExtractedReceipt, ReceiptApiResponse, ReceiptTimings } from './receiptTypes'
-import { supabase } from './supabase'
+import { findDuplicateMatches, getExpenseWarnings, type DuplicateMatch, type ExpenseWarning } from './expenseReview'
 
 export type ExpenseRecord = {
   id: string
@@ -24,14 +23,6 @@ export type ExpenseRecord = {
   attachmentType: string
   attachmentData: string
   createdAt: string
-}
-
-type CategoryTotals = {
-  category: string
-  count: number
-  total: number
-  gst: number
-  pst: number
 }
 
 type ExpenseTrackerProps = {
@@ -261,13 +252,11 @@ const normalizeDate = (value: string | null) => {
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? '' : date.toISOString().slice(0, 10)
 }
-const receiptToDraft = (receipt: ExtractedReceipt, isPdf: boolean): Partial<ExpenseDraft> => ({
-  merchant: receipt.vendor ?? '', date: normalizeDate(receipt.date), category: normalizeCategory(receipt.category),
+const receiptToDraft = (receipt: ExtractedReceipt): Partial<ExpenseDraft> => ({
+  merchant: receipt.vendor ?? '', date: normalizeDate(receipt.date), category: receipt.category ? normalizeCategory(receipt.category) : '',
   subtotal: receipt.subtotal == null ? '' : receipt.subtotal.toFixed(2), gst: receipt.gst == null ? '' : receipt.gst.toFixed(2),
   pst: receipt.pst == null ? '' : receipt.pst.toFixed(2), total: receipt.total == null ? '' : receipt.total.toFixed(2),
   invoiceNumber: receipt.receiptNumber ?? '', paymentMethod: receipt.paymentMethod ?? '',
-  // Line items are no longer extracted (latency); currency keeps the draft default (CAD).
-  description: isPdf ? `${receipt.vendor ?? 'Invoice'} - ${receipt.category} items` : '',
 })
 const formatAmount = (value: string) => value && Number.isFinite(Number(value)) ? new Intl.NumberFormat('en-CA', { style: 'currency', currency: 'CAD' }).format(Number(value)) : '—'
 const amountInCents = (value: string) => {
@@ -303,22 +292,10 @@ const formatCurrencyColumns = (sheet: XLSX.WorkSheet, columns: number[], rows: n
 const dateLabel = (value: string) => value ? new Date(`${value}T00:00:00`).toLocaleDateString('en-CA', { dateStyle: 'medium' }) : '—'
 const monthLabel = (value: string) => value === 'Unknown date' ? value : new Date(`${value}-01T00:00:00`).toLocaleDateString('en-CA', { month: 'long', year: 'numeric' })
 const expenseTotal = (expense: ExpenseRecord) => Number.isFinite(Number(expense.total)) ? Number(expense.total) : 0
-const formatTaxValue = (value: string) => value.trim() && Number.isFinite(Number(value)) ? formatCents(amountInCents(value)) : 'Missing'
 const isValidExpenseDate = (value: string) => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
   const date = new Date(`${value}T00:00:00Z`)
   return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value
-}
-const escapeFilePart = (value: string) => value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'Unknown'
-const dataUrlToBlob = (dataUrl: string) => {
-  const separator = dataUrl.indexOf(',')
-  if (!dataUrl.startsWith('data:') || separator < 0) throw new Error('A saved receipt has invalid data')
-  const metadata = dataUrl.slice(5, separator)
-  const payload = dataUrl.slice(separator + 1)
-  const binary = metadata.endsWith(';base64') ? atob(payload) : decodeURIComponent(payload)
-  return new Blob([Uint8Array.from(binary, (character) => character.charCodeAt(0))], {
-    type: metadata.split(';')[0] || 'application/octet-stream',
-  })
 }
 const triggerDownload = (blob: Blob, filename: string) => {
   const url = URL.createObjectURL(blob)
@@ -330,128 +307,147 @@ const triggerDownload = (blob: Blob, filename: string) => {
   anchor.remove()
   window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
 }
-const buildQuarterlyPdf = (
-  quarter: string,
-  year: string,
-  expenses: ExpenseRecord[],
-  unknownDateExpenses: ExpenseRecord[],
-  totals: { total: number; gst: number; pst: number },
-  categories: CategoryTotals[],
-) => {
-  const pdf = new jsPDF({ orientation: 'landscape', unit: 'pt', format: 'letter' })
-  const pageWidth = pdf.internal.pageSize.getWidth()
-  const pageHeight = pdf.internal.pageSize.getHeight()
-  const margin = 36
-  const columns = [
-    { label: 'Date', width: 52 },
-    { label: 'Merchant', width: 100 },
-    { label: 'Category', width: 105 },
-    { label: 'Description', width: 190 },
-    { label: 'Subtotal', width: 58 },
-    { label: 'GST', width: 50 },
-    { label: 'PST', width: 50 },
-    { label: 'Total', width: 65 },
-  ]
-  const drawTransactionTable = (rows: ExpenseRecord[], title: string) => {
-    let y = 40
-    pdf.setFont('helvetica', 'bold')
-    pdf.setFontSize(15)
-    pdf.text(title, margin, y)
-    y += 14
-    pdf.setFontSize(7)
-    const drawHeader = () => {
-      pdf.setFillColor(120, 53, 15)
-      pdf.rect(margin, y, pageWidth - margin * 2, 19, 'F')
-      pdf.setTextColor(255, 255, 255)
-      pdf.setFont('helvetica', 'bold')
-      let x = margin + 4
-      columns.forEach((column) => {
-        pdf.text(column.label, x, y + 12)
-        x += column.width
-      })
-      pdf.setTextColor(35, 35, 35)
-      y += 19
-    }
-    drawHeader()
-    rows.forEach((expense, index) => {
-      const values = [
-        isValidExpenseDate(expense.date) ? dateLabel(expense.date) : 'Unknown date',
-        expense.merchant || 'Unnamed merchant',
-        canonicalCategory(expense.category),
-        expense.description || '—',
-        expense.subtotal.trim() ? formatTaxValue(expense.subtotal) : '—',
-        formatTaxValue(expense.gst),
-        formatTaxValue(expense.pst),
-        expense.total.trim() ? formatTaxValue(expense.total) : '—',
-      ]
-      const wrapped = values.map((value, valueIndex) => pdf.splitTextToSize(value, columns[valueIndex].width - 7) as string[])
-      const rowHeight = Math.max(19, ...wrapped.map((lines) => lines.length * 8 + 7))
-      if (y + rowHeight > pageHeight - margin) {
-        pdf.addPage()
-        y = 40
-        drawHeader()
-      }
-      if (index % 2 === 1) {
-        pdf.setFillColor(250, 247, 242)
-        pdf.rect(margin, y, pageWidth - margin * 2, rowHeight, 'F')
-      }
-      let x = margin + 4
-      wrapped.forEach((lines, valueIndex) => {
-        pdf.setFont('helvetica', 'normal')
-        pdf.setFontSize(7)
-        pdf.text(lines, x, y + 10)
-        x += columns[valueIndex].width
-      })
-      y += rowHeight
+const errorMessage = (error: unknown, fallback: string) => {
+  if (error instanceof Error) return error.message
+  if (typeof error === 'object' && error !== null && 'message' in error) return String(error.message)
+  return fallback
+}
+const attachmentFromDataUrl = (dataUrl: string, fallbackType: string) => {
+  const separator = dataUrl.indexOf(',')
+  if (!dataUrl.startsWith('data:') || separator < 0) throw new Error('Saved receipt data is invalid')
+  const metadata = dataUrl.slice(5, separator)
+  const content = dataUrl.slice(separator + 1)
+  const mimeType = metadata.split(';')[0] || fallbackType || 'application/octet-stream'
+  const binary = metadata.toLowerCase().includes(';base64')
+    ? atob(content)
+    : decodeURIComponent(content)
+  const bytes = metadata.toLowerCase().includes(';base64')
+    ? Uint8Array.from(binary, (character) => character.charCodeAt(0))
+    : new TextEncoder().encode(binary)
+  return { bytes, mimeType, blob: new Blob([bytes], { type: mimeType }) }
+}
+const receiptFilenamePart = (value: string) => value
+  .normalize('NFKD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .replace(/[^a-zA-Z0-9._-]+/g, '-')
+  .replace(/^-+|-+$/g, '')
+  .slice(0, 60) || 'Unknown'
+const receiptExtension = (name: string, mimeType: string) => {
+  const originalExtension = /\.([a-z0-9]{1,10})$/i.exec(name)?.[1]
+  if (originalExtension) return originalExtension
+  const extensions: Record<string, string> = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/heic': 'heic',
+    'image/heif': 'heif',
+    'application/pdf': 'pdf',
+  }
+  return extensions[mimeType] || 'bin'
+}
+type PackagedReceipt = {
+  filename: string
+  isImage: boolean
+  thumbnail?: { bytes: Uint8Array; width: number; height: number }
+}
+const sha256 = async (bytes: Uint8Array) => {
+  const buffer = new ArrayBuffer(bytes.byteLength)
+  new Uint8Array(buffer).set(bytes)
+  const digest = await crypto.subtle.digest('SHA-256', buffer)
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+const createReceiptThumbnail = async (blob: Blob) => {
+  const url = URL.createObjectURL(blob)
+  try {
+    const image = new Image()
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve()
+      image.onerror = () => reject(new Error('The browser could not decode this receipt image for a thumbnail'))
+      image.src = url
     })
+    const scale = Math.min(1, 72 / image.naturalWidth, 72 / image.naturalHeight)
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale))
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale))
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('Could not create a receipt thumbnail')
+    context.fillStyle = '#ffffff'
+    context.fillRect(0, 0, canvas.width, canvas.height)
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    const thumbnail = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((result) => result ? resolve(result) : reject(new Error('Could not encode a receipt thumbnail')), 'image/jpeg', 0.82)
+    })
+    return { bytes: new Uint8Array(await thumbnail.arrayBuffer()), width: canvas.width, height: canvas.height }
+  } finally {
+    URL.revokeObjectURL(url)
   }
+}
+const appendStyleEntry = (xml: string, tag: string, entry: string) => {
+  const expression = new RegExp(`<${tag} count="(\\d+)">([\\s\\S]*?)</${tag}>`)
+  const updated = xml.replace(expression, (_collection, count: string, children: string) => (
+    `<${tag} count="${Number(count) + 1}">${children}${entry}</${tag}>`
+  ))
+  if (updated === xml) throw new Error(`Could not add workbook ${tag} formatting`)
+  return updated
+}
+const styleWorkbookHeaders = async (workbook: JSZip) => {
+  const stylesFile = workbook.file('xl/styles.xml')
+  if (!stylesFile) throw new Error('Could not style the accountant workbook')
+  let styles = await stylesFile.async('string')
+  styles = appendStyleEntry(styles, 'fonts', '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/><family val="2"/></font>')
+  styles = appendStyleEntry(styles, 'fills', '<fill><patternFill patternType="solid"><fgColor rgb="FF78350F"/><bgColor indexed="64"/></patternFill></fill>')
+  styles = appendStyleEntry(styles, 'cellXfs', '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>')
+  workbook.file('xl/styles.xml', styles)
+  for (const sheetPath of ['xl/worksheets/sheet1.xml', 'xl/worksheets/sheet2.xml', 'xl/worksheets/sheet3.xml']) {
+    const sheetFile = workbook.file(sheetPath)
+    if (!sheetFile) throw new Error('Could not format the accountant workbook sheets')
+    const sheet = await sheetFile.async('string')
+    const styledSheet = sheet.replace(/(<row\b[^>]*\br="1"[^>]*>[\s\S]*?<\/row>)/, (row) => row.replace(/<c\b([^>]*)>/g, (cell, attributes: string) => (
+      /\bs=/.test(attributes) ? cell : `<c${attributes} s="1">`
+    )))
+    workbook.file(sheetPath, styledSheet)
+  }
+}
+const addWorkbookThumbnails = async (workbook: JSZip, thumbnails: Array<{ row: number; bytes: Uint8Array; width: number; height: number }>) => {
+  if (thumbnails.length === 0) return
+  const sheetPath = 'xl/worksheets/sheet1.xml'
+  const sheetFile = workbook.file(sheetPath)
+  const contentTypesFile = workbook.file('[Content_Types].xml')
+  if (!sheetFile || !contentTypesFile) throw new Error('Could not add receipt thumbnails to the workbook')
 
-  pdf.setFillColor(120, 53, 15)
-  pdf.rect(0, 0, pageWidth, 112, 'F')
-  pdf.setTextColor(255, 255, 255)
-  pdf.setFont('helvetica', 'bold')
-  pdf.setFontSize(22)
-  pdf.text('FWF Hauling', margin, 38)
-  pdf.setFontSize(13)
-  pdf.text(`${quarter} ${year} Quarterly Expense Report`, margin, 60)
-  pdf.setFont('helvetica', 'normal')
-  pdf.setFontSize(9)
-  pdf.text(`Transactions: ${expenses.length}  |  Total expenses: ${formatCents(totals.total)}  |  GST: ${formatCents(totals.gst)}  |  PST: ${formatCents(totals.pst)}`, margin, 82)
+  const relationshipsPath = 'xl/worksheets/_rels/sheet1.xml.rels'
+  const relationshipsFile = workbook.file(relationshipsPath)
+  let relationships = relationshipsFile
+    ? await relationshipsFile.async('string')
+    : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>'
+  const relationshipIds = [...relationships.matchAll(/\bId="rId(\d+)"/g)].map((match) => Number(match[1]))
+  const drawingId = `rId${Math.max(0, ...relationshipIds) + 1}`
+  relationships = relationships.replace('</Relationships>', `<Relationship Id="${drawingId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/></Relationships>`)
+  workbook.file(relationshipsPath, relationships)
 
-  let y = 139
-  pdf.setTextColor(35, 35, 35)
-  pdf.setFont('helvetica', 'bold')
-  pdf.setFontSize(12)
-  pdf.text('Category summary', margin, y)
-  y += 16
-  pdf.setFontSize(8)
-  pdf.text('Category', margin, y)
-  pdf.text('Expenses', margin + 220, y)
-  pdf.text('GST', margin + 330, y)
-  pdf.text('PST', margin + 430, y)
-  y += 5
-  categories.forEach((category) => {
-    y += 14
-    pdf.setFont('helvetica', 'normal')
-    pdf.text(category.category, margin, y)
-    pdf.text(`${formatCents(category.total)} (${category.count})`, margin + 220, y)
-    pdf.text(formatCents(category.gst), margin + 330, y)
-    pdf.text(formatCents(category.pst), margin + 430, y)
+  let drawingRelationships = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+  let drawingContent = '<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+  thumbnails.forEach((thumbnail, index) => {
+    const imageId = `rId${index + 1}`
+    const imageName = `image${index + 1}.jpg`
+    const extentWidth = thumbnail.width * 9525
+    const extentHeight = thumbnail.height * 9525
+    workbook.file(`xl/media/${imageName}`, thumbnail.bytes)
+    drawingRelationships += `<Relationship Id="${imageId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${imageName}"/>`
+    drawingContent += `<xdr:oneCellAnchor><xdr:from><xdr:col>8</xdr:col><xdr:colOff>1400000</xdr:colOff><xdr:row>${thumbnail.row - 1}</xdr:row><xdr:rowOff>95000</xdr:rowOff></xdr:from><xdr:ext cx="${extentWidth}" cy="${extentHeight}"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${index + 1}" name="Receipt thumbnail ${index + 1}"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="${imageId}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${extentWidth}" cy="${extentHeight}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>`
   })
-  if (unknownDateExpenses.length > 0) {
-    y += 22
-    pdf.setTextColor(153, 27, 27)
-    pdf.setFont('helvetica', 'bold')
-    pdf.text(`${unknownDateExpenses.length} expense${unknownDateExpenses.length === 1 ? '' : 's'} are listed under Expenses requiring date review and excluded from quarter totals.`, margin, y)
-  }
+  drawingContent += '</xdr:wsDr>'
+  drawingRelationships += '</Relationships>'
+  workbook.file('xl/drawings/drawing1.xml', drawingContent)
+  workbook.file('xl/drawings/_rels/drawing1.xml.rels', drawingRelationships)
 
-  pdf.addPage()
-  drawTransactionTable(expenses, 'Individual expenses')
-  if (unknownDateExpenses.length > 0) {
-    pdf.addPage()
-    drawTransactionTable(unknownDateExpenses, 'Expenses requiring date review')
+  const sheet = await sheetFile.async('string')
+  workbook.file(sheetPath, sheet.replace('</worksheet>', `<drawing r:id="${drawingId}"/></worksheet>`))
+  let contentTypes = await contentTypesFile.async('string')
+  if (!contentTypes.includes('Extension="jpg"')) {
+    contentTypes = contentTypes.replace('</Types>', '<Default Extension="jpg" ContentType="image/jpeg"/></Types>')
   }
-  return pdf.output('blob')
+  contentTypes = contentTypes.replace('</Types>', '<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>')
+  workbook.file('[Content_Types].xml', contentTypes)
 }
 const sortedByExpenseDate = (items: ExpenseRecord[]) => [...items].sort((a, b) => {
   const dateDifference = b.date.localeCompare(a.date)
@@ -482,8 +478,35 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   const [editingDraft, setEditingDraft] = useState<ExpenseDraft | null>(null)
   const [deleteExpenseId, setDeleteExpenseId] = useState<string | null>(null)
   const [expenseMenuId, setExpenseMenuId] = useState<string | null>(null)
+  const [duplicateMatches, setDuplicateMatches] = useState<DuplicateMatch[]>([])
+  const [duplicateScanError, setDuplicateScanError] = useState('')
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const longPressActivated = useRef(false)
+
+  useEffect(() => {
+    let active = true
+    const compareReceipts = async () => {
+      try {
+        const imageEntries = await Promise.all(expenses
+          .filter((expense) => expense.attachmentData)
+          .map(async (expense) => {
+            const attachment = attachmentFromDataUrl(expense.attachmentData, expense.attachmentType)
+            return [expense.id, await sha256(attachment.bytes)] as const
+          }))
+        if (active) {
+          setDuplicateMatches(findDuplicateMatches(expenses, new Map(imageEntries)))
+          setDuplicateScanError('')
+        }
+      } catch (error) {
+        if (active) {
+          setDuplicateMatches(findDuplicateMatches(expenses, new Map()))
+          setDuplicateScanError(errorMessage(error, 'Saved receipt images could not be compared.'))
+        }
+      }
+    }
+    void compareReceipts()
+    return () => { active = false }
+  }, [expenses])
 
   useEffect(() => {
     const fileInputs = document.querySelectorAll<HTMLInputElement>('input[type="file"]')
@@ -503,7 +526,7 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
       setScan((current) => current ? { ...current, stage: 'done', uploadFraction: 1 } : current)
       const donePauseMs = window.matchMedia('(prefers-reduced-motion: reduce)').matches ? DONE_REDUCED_MOTION_MS : DONE_ANIMATION_MS
       await new Promise<void>((resolve) => { setTimeout(resolve, donePauseMs) })
-      setDraft({ ...emptyDraft, ...receiptToDraft(receipt, isPdf), attachmentName: file.name, attachmentType: file.type || 'application/octet-stream', attachmentData })
+      setDraft({ ...emptyDraft, ...receiptToDraft(receipt), attachmentName: file.name, attachmentType: file.type || 'application/octet-stream', attachmentData })
       setProcessingMessage('Receipt information found. Review the fields before saving.')
     } catch (error) {
       setReceiptError(error instanceof Error ? error.message : 'Receipt scanning failed. Please try again.')
@@ -638,17 +661,68 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
   const quarterTotal = quarterExpenses.reduce((sum, expense) => sum + amountInCents(expense.total), 0)
   const quarterGst = quarterExpenses.reduce((sum, expense) => sum + amountInCents(expense.gst), 0)
   const quarterPst = quarterExpenses.reduce((sum, expense) => sum + amountInCents(expense.pst), 0)
-  const unknownDateExpenses = expenses.filter((expense) => !isValidExpenseDate(expense.date))
-  const quarterTotals = { total: quarterTotal, gst: quarterGst, pst: quarterPst }
   const exportAccountantFiles = async () => {
     setIsExporting(true)
     setExportMessage('')
     setExportError('')
     try {
-      const quarterLabel = `${selectedQuarter}-${selectedQuarterYear}`
-      const transactionRows = [
-        ['Date', 'Merchant', 'Category', 'Description', 'Subtotal', 'GST', 'PST', 'Total expense', 'Receipt filename or reference'],
-        ...quarterExpenses.map((expense) => [
+      const zipFilename = `FWF_Hauling_${selectedQuarter}_${selectedQuarterYear}_Accountant_Export.zip`
+      const exportZip = new JSZip()
+      const receiptsFolder = exportZip.folder('Original_Receipts')
+      if (!receiptsFolder) throw new Error('Could not create the original receipts folder.')
+      const receiptFilesByExpense = new Map<string, PackagedReceipt>()
+      const uniqueReceipts = new Map<string, PackagedReceipt>()
+      const filenameCounts = new Map<string, number>()
+      const unavailableReceipts: string[] = []
+      const unavailableThumbnails: string[] = []
+
+      for (const expense of quarterExpenses) {
+        if (!expense.attachmentData) {
+          unavailableReceipts.push(`${expense.merchant || 'Unnamed merchant'} (${expense.date}, expense ${expense.id})`)
+          continue
+        }
+        try {
+          const attachment = attachmentFromDataUrl(expense.attachmentData, expense.attachmentType)
+          const digest = await sha256(attachment.bytes)
+          let receipt = uniqueReceipts.get(digest)
+          if (!receipt) {
+            const originalName = expense.attachmentName.split(/[\\/]/).pop() || 'receipt'
+            const extension = receiptExtension(originalName, attachment.mimeType)
+            const datePart = isValidExpenseDate(expense.date) ? expense.date : 'Unknown_Date'
+            const baseName = `${receiptFilenamePart(datePart)}_${receiptFilenamePart(expense.merchant || 'Unknown_Merchant')}`
+            const nameKey = `${baseName}.${extension.toLowerCase()}`
+            const duplicateNumber = (filenameCounts.get(nameKey) ?? 0) + 1
+            filenameCounts.set(nameKey, duplicateNumber)
+            const suffix = duplicateNumber === 1 ? '' : `_${duplicateNumber}`
+            const filename = `${baseName}${suffix}.${extension}`
+            receiptsFolder.file(filename, attachment.bytes)
+            receipt = { filename, isImage: attachment.mimeType.startsWith('image/') }
+            if (receipt.isImage) {
+              try {
+                receipt.thumbnail = await createReceiptThumbnail(attachment.blob)
+              } catch (error) {
+                unavailableThumbnails.push(`${expense.merchant || 'Unnamed merchant'} (${expense.date}, ${expense.attachmentName || 'receipt'}): ${errorMessage(error, 'Could not create thumbnail')}`)
+              }
+            }
+            uniqueReceipts.set(digest, receipt)
+          }
+          receiptFilesByExpense.set(expense.id, receipt)
+        } catch (error) {
+          unavailableReceipts.push(`${expense.merchant || 'Unnamed merchant'} (${expense.date}, expense ${expense.id}): ${errorMessage(error, 'Saved receipt data could not be read')}`)
+        }
+      }
+
+      const transactionHeaders = ['Date', 'Merchant', 'Category', 'Description', 'Subtotal', 'GST', 'PST', 'Total', 'Receipt']
+      const transactionRows = quarterExpenses.map((expense) => {
+        const receipt = receiptFilesByExpense.get(expense.id)
+        const receiptLabel = !receipt
+          ? 'Receipt unavailable'
+          : receipt.thumbnail
+            ? 'Open full-size original'
+            : receipt.isImage
+              ? 'Open original (thumbnail unavailable)'
+              : 'Open original document'
+        return [
           expense.date,
           expense.merchant,
           canonicalCategory(expense.category),
@@ -657,137 +731,71 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
           exportAmount(expense.gst),
           exportAmount(expense.pst),
           exportAmount(expense.total),
-          expense.attachmentName || (expense.attachmentData ? 'Receipt attached' : ''),
-        ]),
-      ]
-      const unknownRows = unknownDateExpenses.length > 0
-        ? [
-            [],
-            ['Expenses requiring date review'],
-            transactionRows[0],
-            ...unknownDateExpenses.map((expense) => [
-              expense.date || 'Unknown date',
-              expense.merchant,
-              canonicalCategory(expense.category),
-              expense.description,
-              exportAmount(expense.subtotal),
-              exportAmount(expense.gst),
-              exportAmount(expense.pst),
-              exportAmount(expense.total),
-              expense.attachmentName || (expense.attachmentData ? 'Receipt attached' : ''),
-            ]),
-          ]
-        : []
+          receiptLabel,
+        ]
+      })
       const workbook = XLSX.utils.book_new()
-      const individualSheet = XLSX.utils.aoa_to_sheet([...transactionRows, ...unknownRows])
-      individualSheet['!cols'] = [{ wch: 14 }, { wch: 24 }, { wch: 34 }, { wch: 38 }, { wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 32 }]
-      formatCurrencyColumns(individualSheet, [4, 5, 6, 7], transactionRows.length + unknownRows.length)
+      const individualSheet = XLSX.utils.aoa_to_sheet([transactionHeaders, ...transactionRows])
+      individualSheet['!cols'] = [{ wch: 14 }, { wch: 24 }, { wch: 34 }, { wch: 38 }, { wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 42 }]
+      individualSheet['!rows'] = [{ hpt: 28 }, ...quarterExpenses.map(() => ({ hpt: 78 }))]
+      individualSheet['!views'] = [{ state: 'frozen', ySplit: 1, topLeftCell: 'A2', activePane: 'bottomLeft' }]
+      formatCurrencyColumns(individualSheet, [4, 5, 6, 7], transactionRows.length + 1)
+      const thumbnails: Array<{ row: number; bytes: Uint8Array; width: number; height: number }> = []
+      quarterExpenses.forEach((expense, index) => {
+        const receipt = receiptFilesByExpense.get(expense.id)
+        const receiptCell = individualSheet[XLSX.utils.encode_cell({ r: index + 1, c: 8 })]
+        if (receipt && receiptCell) {
+          receiptCell.l = {
+            Target: `Original_Receipts/${receipt.filename}`,
+            Tooltip: 'Open the full-size original receipt',
+          }
+          if (receipt.thumbnail) thumbnails.push({ row: index + 2, ...receipt.thumbnail })
+        }
+      })
       XLSX.utils.book_append_sheet(workbook, individualSheet, 'Individual Expenses')
       const categoryRows = [
         ['Category', 'Number of expenses', 'Total expenses', 'Total GST', 'Total PST'],
         ...quarterCategories.map(({ category, count, total, gst, pst }) => [category, count, total / 100, gst / 100, pst / 100]),
       ]
       const categorySheet = XLSX.utils.aoa_to_sheet(categoryRows)
+      categorySheet['!cols'] = [{ wch: 42 }, { wch: 22 }, { wch: 18 }, { wch: 16 }, { wch: 16 }]
+      categorySheet['!rows'] = [{ hpt: 28 }, ...quarterCategories.map(() => ({ hpt: 22 }))]
       formatCurrencyColumns(categorySheet, [2, 3, 4], categoryRows.length)
       XLSX.utils.book_append_sheet(workbook, categorySheet, 'Category Summary')
       const summarySheet = XLSX.utils.aoa_to_sheet([
-        ['Quarter', selectedQuarter],
-        ['Year', Number(selectedQuarterYear)],
+        ['Quarterly Tax Summary', ''],
+        ['Business name', 'FWF Hauling'],
+        ['Quarter and year', `${selectedQuarter} ${selectedQuarterYear}`],
         ['Total expenses', quarterTotal / 100],
         ['Total GST', quarterGst / 100],
         ['Total PST', quarterPst / 100],
         ['Number of transactions', quarterExpenses.length],
-        ['Unknown dates for review (excluded from totals)', unknownDateExpenses.length],
       ])
-      for (const cellAddress of ['B3', 'B4', 'B5']) {
+      summarySheet['!cols'] = [{ wch: 40 }, { wch: 26 }]
+      summarySheet['!rows'] = [{ hpt: 28 }, ...Array.from({ length: 6 }, () => ({ hpt: 24 }))]
+      for (const cellAddress of ['B4', 'B5', 'B6']) {
         const cell = summarySheet[cellAddress]
         if (cell?.t === 'n') cell.z = '"$"#,##0.00'
       }
       XLSX.utils.book_append_sheet(workbook, summarySheet, 'Quarterly Tax Summary')
       const spreadsheet = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
-
-      const receiptsZip = new JSZip()
-      const seenReceiptHashes = new Set<string>()
-      const receiptFailures: string[] = []
-      const receiptPathsByExpense = new Map<string, string>()
-      if (quarterExpenses.length > 0) {
-        const { data: receiptRecords, error } = await supabase
-          .from('fwf_expenses')
-          .select('id, receipt_path')
-          .in('id', quarterExpenses.map((expense) => expense.id))
-          .eq('deleted', false)
-        if (error) throw new Error(`Could not check Supabase receipt references: ${error.message}`)
-        receiptRecords?.forEach((record) => {
-          if (record.receipt_path) receiptPathsByExpense.set(record.id, record.receipt_path)
-        })
-      }
-      for (const expense of quarterExpenses) {
-        let receiptBlob: Blob | null = null
-        let storageError: unknown
-        const receiptPath = receiptPathsByExpense.get(expense.id) ?? `${expense.id}/receipt`
-        try {
-          const { data, error } = await supabase.storage.from('expense-receipts').download(receiptPath)
-          if (error) storageError = error
-          else receiptBlob = data
-        } catch (error) {
-          storageError = error
-        }
-        let localAttachmentError: unknown
-        if (!receiptBlob && expense.attachmentData) {
-          try {
-            receiptBlob = dataUrlToBlob(expense.attachmentData)
-          } catch (error) {
-            localAttachmentError = error
-          }
-        }
-        if (!receiptBlob) {
-          const missingStorageObject = typeof storageError === 'object'
-            && storageError !== null
-            && 'statusCode' in storageError
-            && String(storageError.statusCode) === '404'
-          const hasReceiptReference = Boolean(receiptPathsByExpense.has(expense.id) || expense.attachmentData || expense.attachmentName)
-          if (hasReceiptReference || (storageError && !missingStorageObject)) {
-            const reason = localAttachmentError instanceof Error
-              ? localAttachmentError.message
-              : storageError instanceof Error
-              ? storageError.message
-              : storageError && typeof storageError === 'object' && 'message' in storageError
-                ? String(storageError.message)
-                : 'receipt could not be retrieved'
-            receiptFailures.push(`${expense.merchant || 'Unnamed merchant'} (expense ${expense.id}): ${reason}`)
-          }
-          continue
-        }
-        try {
-          const bytes = await receiptBlob.arrayBuffer()
-          const digest = await crypto.subtle.digest('SHA-256', bytes)
-          const receiptHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
-          if (seenReceiptHashes.has(receiptHash)) continue
-          seenReceiptHashes.add(receiptHash)
-          const originalName = expense.attachmentName || `receipt${expense.attachmentType === 'application/pdf' ? '.pdf' : ''}`
-          const receiptName = `${isValidExpenseDate(expense.date) ? expense.date : 'unknown-date'}_${escapeFilePart(expense.merchant)}_${escapeFilePart(expense.id.slice(0, 8))}_${escapeFilePart(originalName)}`
-          receiptsZip.file(receiptName, bytes)
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : 'receipt could not be added to the ZIP'
-          receiptFailures.push(`${expense.merchant || 'Unnamed merchant'} (expense ${expense.id}): ${reason}`)
-        }
-      }
-      if (receiptFailures.length > 0) {
-        receiptsZip.file('Receipt retrieval issues.txt', [
-          'Receipts that could not be retrieved:',
-          ...receiptFailures.map((failure) => `- ${failure}`),
-          '',
-        ].join('\n'))
-      }
-      const receiptArchive = await receiptsZip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } })
-      const report = buildQuarterlyPdf(selectedQuarter, selectedQuarterYear, quarterExpenses, unknownDateExpenses, quarterTotals, quarterCategories)
-
-      triggerDownload(report, `FWF-Hauling-${quarterLabel}-Quarterly-Report.pdf`)
-      triggerDownload(new Blob([spreadsheet], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `FWF-Hauling-${quarterLabel}-Expenses.xlsx`)
-      triggerDownload(receiptArchive, `FWF-Hauling-${quarterLabel}-Receipts.zip`)
-      setExportMessage(`Downloads created for ${selectedQuarter} ${selectedQuarterYear}.`)
-      if (receiptFailures.length > 0) {
-        setExportError(`Some receipts could not be retrieved; see "Receipt retrieval issues.txt" in the ZIP:\n${receiptFailures.join('\n')}`)
+      const workbookZip = await JSZip.loadAsync(spreadsheet)
+      await styleWorkbookHeaders(workbookZip)
+      await addWorkbookThumbnails(workbookZip, thumbnails)
+      exportZip.file('Expense_Report.xlsx', await workbookZip.generateAsync({ type: 'uint8array' }))
+      const archive = await exportZip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 } })
+      triggerDownload(archive, zipFilename)
+      setExportMessage(`ZIP download started: ${zipFilename}`)
+      const exportWarnings = [
+        unavailableReceipts.length > 0
+          ? `Receipt images unavailable in the app's loaded data (not fetched from Supabase):\n${unavailableReceipts.join('\n')}`
+          : '',
+        unavailableThumbnails.length > 0
+          ? `Original receipts are included, but thumbnails could not be created for:\n${unavailableThumbnails.join('\n')}`
+          : '',
+      ].filter(Boolean)
+      if (exportWarnings.length > 0) {
+        setExportError(exportWarnings.join('\n\n'))
       }
     } catch (error) {
       console.error('Could not export accountant files:', error)
@@ -814,6 +822,11 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
     else next.add(category)
     return next
   })
+  const draftWarnings: ExpenseWarning[] = draft
+    ? getExpenseWarnings({ ...draft, id: 'draft', createdAt: '' })
+    : []
+  const expenseWarnings = expenses.flatMap((expense) => getExpenseWarnings(expense)
+    .map((warning) => ({ expense, warning })))
 
   if (editingExpenseId && editingDraft) return (
     <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
@@ -843,8 +856,9 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
     <section className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
       <div className="mb-5 flex items-start justify-between gap-3"><div><p className="text-xs font-semibold uppercase tracking-[0.2em] text-stone-500">Review before saving</p><h2 className="text-2xl font-black text-stone-900">Check receipt details</h2><p className="mt-1 text-sm text-stone-500">Confirm or edit every extracted field before saving.</p><p className="mt-2 text-sm font-semibold text-emerald-700">{processingMessage}</p></div><PencilSquareIcon className="h-5 w-5 text-amber-900" /></div>
       {receiptError && <p role="alert" className="mb-3 text-sm text-red-700">{receiptError}</p>}
+      {draftWarnings.length > 0 && <div role="status" className="mb-4 rounded-2xl bg-amber-50 p-4 text-sm text-amber-950 ring-1 ring-amber-200"><p className="font-bold">Review the flagged receipt details before saving</p><ul className="mt-2 list-inside list-disc space-y-1">{draftWarnings.map((warning, index) => <li key={`${warning.category}-${index}`}>{warning.message}</li>)}</ul></div>}
       <div className="grid gap-3 sm:grid-cols-2">{[['merchant', 'Merchant'], ['date', 'Date'], ['subtotal', 'Subtotal'], ['gst', 'GST'], ['pst', 'PST'], ['total', 'Total'], ['invoiceNumber', 'Receipt number'], ['paymentMethod', 'Payment method']].map(([field, label]) => <label key={field} className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">{label}</span><input type={field === 'date' ? 'date' : 'text'} value={draft[field as keyof ExpenseDraft]} onChange={(event) => updateDraft(field as keyof ExpenseDraft, event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none focus:border-amber-700" /></label>)}
-        <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Category</span><select value={draft.category} onChange={(event) => updateDraft('category', event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none">{CATEGORIES.map((category) => <option key={category}>{category}</option>)}</select></label>
+        <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200"><span className="mb-2 block text-sm font-semibold">Category</span><select value={draft.category} onChange={(event) => updateDraft('category', event.target.value)} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none">{!draft.category && <option value="">Select category — review receipt</option>}{CATEGORIES.map((category) => <option key={category}>{category}</option>)}</select></label>
         <label className="rounded-2xl bg-stone-50 p-3 ring-1 ring-stone-200 sm:col-span-2"><span className="mb-2 block text-sm font-semibold">Description</span><textarea value={draft.description} onChange={(event) => updateDraft('description', event.target.value)} rows={3} className="w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 outline-none" /></label>
       </div>
       <div className="mt-5 flex flex-wrap items-center gap-3"><button type="button" onClick={() => setDraft(null)} className="rounded-2xl bg-stone-200 px-4 py-3 text-sm font-semibold text-stone-800">Cancel</button><button type="button" onClick={saveExpense} className="flex items-center gap-2 rounded-2xl bg-amber-900 px-4 py-3 text-sm font-semibold text-white"><CheckCircleIcon className="h-5 w-5" /> Save Expense</button><span className="text-xs text-stone-500">Attached: {draft.attachmentName}</span></div>
@@ -881,6 +895,52 @@ function ExpenseTracker({ expenses, onExpensesChange }: ExpenseTrackerProps) {
           <div className="rounded-2xl bg-stone-50 p-4 ring-1 ring-stone-200"><p className="text-xs font-semibold uppercase tracking-wide text-stone-500">Yearly totals</p><p className="mt-1 text-xl font-black text-stone-900">{yearlyTotals.length}</p></div>
         </div>
       </div>
+
+      <section aria-label="Expense warnings and duplicate review" className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
+        <div className="mb-4">
+          <p className="text-sm font-semibold text-stone-900">Warnings &amp; duplicate review</p>
+          <p className="mt-1 text-sm text-stone-500">Warnings never change or remove an expense. Review each flagged record manually.</p>
+        </div>
+        {duplicateScanError && <p role="alert" className="mb-3 rounded-xl bg-red-50 p-3 text-sm text-red-800">{duplicateScanError}</p>}
+        {duplicateMatches.length === 0 && expenseWarnings.length === 0
+          ? <p className="rounded-xl bg-stone-50 p-3 text-sm text-stone-600">No warnings found in the loaded expenses.</p>
+          : <div className="space-y-4">
+            {duplicateMatches.map(({ first, second, confirmed }) => (
+              <article key={`${first.id}-${second.id}`} className="rounded-2xl bg-amber-50 p-4 ring-1 ring-amber-200">
+                <h3 className="font-bold text-amber-950">{confirmed ? 'Confirmed duplicate receipt' : 'Possible duplicate transaction'}</h3>
+                <p className="mt-1 text-sm text-amber-900">{confirmed
+                  ? 'These transactions have identical saved receipt image data.'
+                  : 'Merchant, date, and amount are similar. Compare the receipts; this is not confirmation of a duplicate.'}</p>
+                <div className="mt-3 grid gap-3 md:grid-cols-2">
+                  {[first, second].map((expense) => (
+                    <div key={expense.id} className="min-w-0 rounded-xl bg-white p-3 ring-1 ring-amber-200">
+                      <p className="font-semibold text-stone-900">{expense.merchant || 'Unnamed merchant'}</p>
+                      <p className="mt-1 text-sm text-stone-600">{dateLabel(expense.date)} · {formatAmount(expense.total)} · {canonicalCategory(expense.category)}</p>
+                      <div className="mt-3 flex min-h-36 items-center justify-center overflow-hidden rounded-lg bg-stone-100">
+                        {expense.attachmentData
+                          ? expense.attachmentType === 'application/pdf'
+                            ? <iframe title={`Receipt for ${expense.merchant || 'unnamed merchant'}`} src={expense.attachmentData} className="h-56 w-full" />
+                            : <img src={expense.attachmentData} alt={`Receipt for ${expense.merchant || 'unnamed merchant'}`} className="max-h-64 w-full object-contain" />
+                          : <p className="p-3 text-sm text-stone-500">Receipt image is not available in the loaded expense data.</p>}
+                      </div>
+                      <button type="button" onClick={() => startEdit(expense)} className="mt-3 rounded-xl bg-amber-900 px-3 py-2 text-sm font-semibold text-white">Review transaction</button>
+                    </div>
+                  ))}
+                </div>
+              </article>
+            ))}
+            {expenseWarnings.map(({ expense, warning }, index) => (
+              <div key={`${expense.id}-${warning.category}-${index}`} className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-stone-50 p-3 ring-1 ring-stone-200">
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-wide text-amber-900">{warning.category === 'missing' ? 'Missing / unreadable information' : `${warning.category.toUpperCase()} needs review`}</p>
+                  <p className="mt-1 text-sm text-stone-800">{warning.message}</p>
+                  <p className="mt-1 text-xs text-stone-500">{expense.merchant || 'Unnamed merchant'} · {dateLabel(expense.date)} · {formatAmount(expense.total)}</p>
+                </div>
+                <button type="button" onClick={() => startEdit(expense)} className="rounded-xl bg-stone-200 px-3 py-2 text-sm font-semibold text-stone-800">Review transaction</button>
+              </div>
+            ))}
+          </div>}
+      </section>
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(260px,1fr)]">
         <div className="rounded-[28px] bg-white p-4 shadow-sm ring-1 ring-stone-200 sm:p-6">
